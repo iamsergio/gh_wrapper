@@ -219,6 +219,18 @@ fn merge_pr(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Server-side rebase onto the latest base branch; no local checkout needed.
+fn rebase_pr(url: &str) -> Result<(), String> {
+    let status = Command::new("gh")
+        .args(["pr", "update-branch", url, "--rebase"])
+        .status()
+        .map_err(|e| format!("failed to run gh: {e}"))?;
+    if !status.success() {
+        return Err("`gh pr update-branch` failed".to_string());
+    }
+    Ok(())
+}
+
 /// Best effort: the PR is already merged, so failures are only warnings.
 fn delete_remote_branch(repo: &str, branch: &str) {
     let output = Command::new("gh")
@@ -383,8 +395,9 @@ fn main() -> ExitCode {
                 print!("{}", format_table(&prs, now));
             }),
         [cmd, url] if cmd == "merge" => merge_pr(url),
+        [cmd, url] if cmd == "rebase" => rebase_pr(url),
         _ => {
-            eprintln!("usage: gh_wrapper [merge <pr-url>]");
+            eprintln!("usage: gh_wrapper [merge <pr-url> | rebase <pr-url>]");
             return ExitCode::FAILURE;
         }
     };
