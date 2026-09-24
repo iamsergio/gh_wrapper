@@ -13,6 +13,8 @@ Startup sequence in `src/main.rs`:
 
 `gh_wrapper merge <pr-url>` instead looks up the PR's CI and head branch/commit via a GraphQL `resource(url:)` query and, only if CI is green, runs `gh pr merge <url> --rebase --match-head-commit <oid>` (non-interactive), then deletes the remote head branch via `gh api -X DELETE repos/…/git/refs/heads/…`. `--delete-branch` isn't used because it also deletes the local branch, which we keep. Failed, running or missing CI aborts with exit 1.
 
+`gh_wrapper rebase <pr-url>` runs `gh pr update-branch <url> --rebase`, a server-side rebase onto the latest base branch (no local checkout needed; fails on conflicts).
+
 ## Commands
 
 CI (`.github/workflows/build.yml`, Linux/macOS/Windows) runs these; keep them passing:
