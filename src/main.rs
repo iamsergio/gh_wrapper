@@ -1,6 +1,6 @@
 use std::process::{Command, ExitCode, Stdio};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use chrono_humanize::HumanTime;
 use serde::Deserialize;
 
@@ -184,6 +184,19 @@ fn relative_time(timestamp: &str, now: DateTime<Utc>) -> String {
     }
 }
 
+/// Release PRs are opened by bots and tend to linger; hide them once they're stale.
+fn is_hidden(pr: &PullRequest, now: DateTime<Utc>) -> bool {
+    let Ok(updated) = DateTime::parse_from_rfc3339(&pr.updated_at) else {
+        return false;
+    };
+    pr.title.starts_with("chore: release")
+        && now - updated.with_timezone(&Utc) > TimeDelta::days(30)
+}
+
+fn filter_prs(prs: Vec<PullRequest>, now: DateTime<Utc>) -> Vec<PullRequest> {
+    prs.into_iter().filter(|pr| !is_hidden(pr, now)).collect()
+}
+
 fn format_table(prs: &[PullRequest], now: DateTime<Utc>) -> String {
     let headers = ["REPO", "TITLE", "URL", "LAST UPDATED"];
     let updated: Vec<String> = prs
@@ -241,7 +254,9 @@ fn main() -> ExitCode {
 
     match list_open_prs().and_then(|json| parse_prs(&json)) {
         Ok(prs) => {
-            print!("{}", format_table(&prs, Utc::now()));
+            let now = Utc::now();
+            let prs = filter_prs(prs, now);
+            print!("{}", format_table(&prs, now));
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -328,6 +343,30 @@ mod tests {
 
     fn now() -> DateTime<Utc> {
         "2026-09-24T21:00:00Z".parse().unwrap()
+    }
+
+    fn pr(title: &str, updated_at: &str) -> PullRequest {
+        PullRequest {
+            repo: "o/r".into(),
+            title: title.into(),
+            url: "https://a/1".into(),
+            updated_at: updated_at.into(),
+            ci: CiStatus::None,
+        }
+    }
+
+    #[test]
+    fn filter_prs_hides_stale_release_prs() {
+        let prs = vec![
+            pr("chore: release v1", "2026-05-02T10:32:51Z"),
+            pr("chore: release v2", "2026-09-20T00:00:00Z"),
+            pr("feat: old but not a release", "2025-01-01T00:00:00Z"),
+        ];
+        let titles: Vec<_> = filter_prs(prs, now())
+            .into_iter()
+            .map(|pr| pr.title)
+            .collect();
+        assert_eq!(titles, ["chore: release v2", "feat: old but not a release"]);
     }
 
     #[test]

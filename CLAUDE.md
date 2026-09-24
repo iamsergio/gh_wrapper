@@ -9,7 +9,7 @@ Rust CLI (edition 2024, deps: `serde`, `serde_json`, `chrono`, `chrono-humanize`
 Startup sequence in `src/main.rs`:
 1. `gh --version` — exit 1 if `gh` is missing.
 2. `gh auth status` — exit 1 and print `gh auth login` if not authenticated.
-3. `gh api graphql` searching `is:pr is:open author:@me` — fetches repo (`nameWithOwner`), title, URL, `updatedAt` and the head commit's `statusCheckRollup` state; JSON is parsed with serde, sorted by `updatedAt` descending, and printed as a table with relative dates via `chrono-humanize` (e.g. "2 months ago") (one row per PR) with a CI column (🟢 success, 🔴 failure/error, 🟡 pending, blank if no checks). GraphQL is used because `gh search prs --json` can't return CI status, and a search is used instead of `gh pr list` because the latter requires being inside a repo.
+3. `gh api graphql` searching `is:pr is:open author:@me` — fetches repo (`nameWithOwner`), title, URL, `updatedAt` and the head commit's `statusCheckRollup` state; JSON is parsed with serde, sorted by `updatedAt` descending, and printed as a table with relative dates via `chrono-humanize` (e.g. "2 months ago"); PRs titled `chore: release…` not updated in 30+ days are hidden (one row per PR) with a CI column (🟢 success, 🔴 failure/error, 🟡 pending, blank if no checks). GraphQL is used because `gh search prs --json` can't return CI status, and a search is used instead of `gh pr list` because the latter requires being inside a repo.
 
 ## Commands
 
