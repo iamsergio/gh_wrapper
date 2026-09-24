@@ -34,6 +34,7 @@ impl CiStatus {
 
 #[derive(Debug, PartialEq)]
 struct PullRequest {
+    repo: String,
     title: String,
     url: String,
     updated_at: String,
@@ -59,10 +60,17 @@ struct Search {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PrNode {
+    repository: Repository,
     title: String,
     url: String,
     updated_at: String,
     commits: Commits,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Repository {
+    name_with_owner: String,
 }
 
 #[derive(Deserialize)]
@@ -96,6 +104,7 @@ impl From<PrNode> for PullRequest {
             .map(|r| r.state.as_str());
         Self {
             ci: CiStatus::from_rollup_state(state),
+            repo: node.repository.name_with_owner,
             title: node.title,
             url: node.url,
             updated_at: node.updated_at,
@@ -109,6 +118,7 @@ const QUERY: &str = "query {
   search(query: \"is:pr is:open author:@me\", type: ISSUE, first: 100) {
     nodes {
       ... on PullRequest {
+        repository { nameWithOwner }
         title
         url
         updatedAt
@@ -165,10 +175,17 @@ fn parse_prs(json: &str) -> Result<Vec<PullRequest>, String> {
 }
 
 fn format_table(prs: &[PullRequest]) -> String {
-    let headers = ["TITLE", "URL", "LAST UPDATED"];
-    let rows: Vec<[&str; 3]> = prs
+    let headers = ["REPO", "TITLE", "URL", "LAST UPDATED"];
+    let rows: Vec<[&str; 4]> = prs
         .iter()
-        .map(|pr| [pr.title.as_str(), pr.url.as_str(), pr.updated_at.as_str()])
+        .map(|pr| {
+            [
+                pr.repo.as_str(),
+                pr.title.as_str(),
+                pr.url.as_str(),
+                pr.updated_at.as_str(),
+            ]
+        })
         .collect();
 
     // Width in chars rather than bytes, so non-ASCII titles stay aligned.
@@ -185,15 +202,12 @@ fn format_table(prs: &[PullRequest]) -> String {
 
     let mut out = String::new();
     for (icon, row) in icons.zip(std::iter::once(headers).chain(rows)) {
-        let line = format!(
-            "{icon}  {:<w0$}  {:<w1$}  {}",
-            row[0],
-            row[1],
-            row[2],
-            w0 = widths[0],
-            w1 = widths[1]
-        );
-        out.push_str(&line);
+        out.push_str(icon);
+        for (cell, w) in row.iter().zip(widths) {
+            out.push_str(&format!("  {cell:<w$}"));
+        }
+        // Last column is padded too; don't leave trailing spaces.
+        out.truncate(out.trim_end().len());
         out.push('\n');
     }
     out
@@ -232,7 +246,7 @@ mod tests {
             None => "null".to_string(),
         };
         format!(
-            r#"{{"title":"{title}","url":"https://a/{title}","updatedAt":"{updated_at}",
+            r#"{{"repository":{{"nameWithOwner":"o/r"}},"title":"{title}","url":"https://a/{title}","updatedAt":"{updated_at}",
                 "commits":{{"nodes":[{{"commit":{{"statusCheckRollup":{rollup}}}}}]}}}}"#
         )
     }
@@ -301,12 +315,14 @@ mod tests {
     fn format_table_aligns_columns() {
         let prs = [
             PullRequest {
+                repo: "KDAB/KDDockWidgets".into(),
                 title: "short".into(),
                 url: "https://a/1".into(),
                 updated_at: "2026-09-24T20:16:53Z".into(),
                 ci: CiStatus::Success,
             },
             PullRequest {
+                repo: "o/r".into(),
                 title: "a longer title".into(),
                 url: "https://a/22".into(),
                 updated_at: "2026-07-31T10:37:06Z".into(),
@@ -314,9 +330,9 @@ mod tests {
             },
         ];
         let expected = "\
-CI  TITLE           URL           LAST UPDATED
-🟢  short           https://a/1   2026-09-24T20:16:53Z
-🟡  a longer title  https://a/22  2026-07-31T10:37:06Z
+CI  REPO                TITLE           URL           LAST UPDATED
+🟢  KDAB/KDDockWidgets  short           https://a/1   2026-09-24T20:16:53Z
+🟡  o/r                 a longer title  https://a/22  2026-07-31T10:37:06Z
 ";
         assert_eq!(format_table(&prs), expected);
     }
