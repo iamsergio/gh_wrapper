@@ -96,16 +96,21 @@ struct Rollup {
     state: String,
 }
 
-impl From<PrNode> for PullRequest {
-    fn from(node: PrNode) -> Self {
-        let state = node
-            .commits
+impl Commits {
+    fn ci_status(&self) -> CiStatus {
+        let state = self
             .nodes
             .first()
             .and_then(|c| c.commit.status_check_rollup.as_ref())
             .map(|r| r.state.as_str());
+        CiStatus::from_rollup_state(state)
+    }
+}
+
+impl From<PrNode> for PullRequest {
+    fn from(node: PrNode) -> Self {
         Self {
-            ci: CiStatus::from_rollup_state(state),
+            ci: node.commits.ci_status(),
             repo: node.repository.name_with_owner,
             title: node.title,
             url: node.url,
@@ -130,6 +135,60 @@ const QUERY: &str = "query {
   }
 }";
 
+const PR_CI_QUERY: &str = "query($url: URI!) {
+  resource(url: $url) {
+    ... on PullRequest {
+      commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+    }
+  }
+}";
+
+#[derive(Deserialize)]
+struct ResourceResponse {
+    data: ResourceData,
+}
+
+#[derive(Deserialize)]
+struct ResourceData {
+    resource: Option<Resource>,
+}
+
+// Non-PR resources match no fragment and deserialize as `{}`, i.e. `commits: None`.
+#[derive(Deserialize)]
+struct Resource {
+    commits: Option<Commits>,
+}
+
+fn parse_pr_ci(json: &str) -> Result<CiStatus, String> {
+    let response: ResourceResponse =
+        serde_json::from_str(json).map_err(|e| format!("failed to parse gh output: {e}"))?;
+    response
+        .data
+        .resource
+        .and_then(|r| r.commits)
+        .map(|c| c.ci_status())
+        .ok_or_else(|| "not a pull request URL".to_string())
+}
+
+fn merge_pr(url: &str) -> Result<(), String> {
+    let ci = parse_pr_ci(&gh_graphql(PR_CI_QUERY, &[("url", url)])?)?;
+    match ci {
+        CiStatus::Success => {}
+        CiStatus::Failure => return Err("CI failed, not merging".to_string()),
+        CiStatus::Running => return Err("CI is still running, not merging".to_string()),
+        CiStatus::None => return Err("PR has no CI checks, not merging".to_string()),
+    }
+    // Stdio is inherited so gh can prompt for the merge method.
+    let status = Command::new("gh")
+        .args(["pr", "merge", url])
+        .status()
+        .map_err(|e| format!("failed to run gh: {e}"))?;
+    if !status.success() {
+        return Err("`gh pr merge` failed".to_string());
+    }
+    Ok(())
+}
+
 fn gh_installed() -> bool {
     Command::new("gh")
         .arg("--version")
@@ -148,10 +207,14 @@ fn gh_authenticated() -> bool {
         .is_ok_and(|s| s.success())
 }
 
-fn list_open_prs() -> Result<String, String> {
-    let output = Command::new("gh")
-        .args(["api", "graphql", "-f"])
-        .arg(format!("query={QUERY}"))
+fn gh_graphql(query: &str, vars: &[(&str, &str)]) -> Result<String, String> {
+    let mut cmd = Command::new("gh");
+    cmd.args(["api", "graphql", "-f"])
+        .arg(format!("query={query}"));
+    for (name, value) in vars {
+        cmd.arg("-f").arg(format!("{name}={value}"));
+    }
+    let output = cmd
         .stderr(Stdio::inherit())
         .output()
         .map_err(|e| format!("failed to run gh: {e}"))?;
@@ -159,6 +222,10 @@ fn list_open_prs() -> Result<String, String> {
         return Err("`gh api graphql` failed".to_string());
     }
     String::from_utf8(output.stdout).map_err(|e| format!("gh returned invalid UTF-8: {e}"))
+}
+
+fn list_open_prs() -> Result<String, String> {
+    gh_graphql(QUERY, &[])
 }
 
 fn parse_prs(json: &str) -> Result<Vec<PullRequest>, String> {
@@ -252,13 +319,24 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    match list_open_prs().and_then(|json| parse_prs(&json)) {
-        Ok(prs) => {
-            let now = Utc::now();
-            let prs = filter_prs(prs, now);
-            print!("{}", format_table(&prs, now));
-            ExitCode::SUCCESS
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let result = match args.as_slice() {
+        [] => list_open_prs()
+            .and_then(|json| parse_prs(&json))
+            .map(|prs| {
+                let now = Utc::now();
+                let prs = filter_prs(prs, now);
+                print!("{}", format_table(&prs, now));
+            }),
+        [cmd, url] if cmd == "merge" => merge_pr(url),
+        _ => {
+            eprintln!("usage: gh_wrapper [merge <pr-url>]");
+            return ExitCode::FAILURE;
         }
+    };
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE
@@ -367,6 +445,23 @@ mod tests {
             .map(|pr| pr.title)
             .collect();
         assert_eq!(titles, ["chore: release v2", "feat: old but not a release"]);
+    }
+
+    #[test]
+    fn parse_pr_ci_states() {
+        let json = r#"{"data":{"resource":{"commits":{"nodes":[
+            {"commit":{"statusCheckRollup":{"state":"SUCCESS"}}}]}}}}"#;
+        assert_eq!(parse_pr_ci(json), Ok(CiStatus::Success));
+
+        let json = r#"{"data":{"resource":{"commits":{"nodes":[
+            {"commit":{"statusCheckRollup":null}}]}}}}"#;
+        assert_eq!(parse_pr_ci(json), Ok(CiStatus::None));
+    }
+
+    #[test]
+    fn parse_pr_ci_rejects_non_pr_urls() {
+        assert!(parse_pr_ci(r#"{"data":{"resource":null}}"#).is_err());
+        assert!(parse_pr_ci(r#"{"data":{"resource":{}}}"#).is_err());
     }
 
     #[test]
