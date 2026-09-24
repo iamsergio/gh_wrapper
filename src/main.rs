@@ -2,13 +2,121 @@ use std::process::{Command, ExitCode, Stdio};
 
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CiStatus {
+    Success,
+    Failure,
+    Running,
+    /// No checks configured for the PR's head commit.
+    None,
+}
+
+impl CiStatus {
+    fn from_rollup_state(state: Option<&str>) -> Self {
+        match state {
+            Some("SUCCESS") => Self::Success,
+            Some("FAILURE" | "ERROR") => Self::Failure,
+            Some("PENDING" | "EXPECTED") => Self::Running,
+            _ => Self::None,
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            Self::Success => "🟢",
+            Self::Failure => "🔴",
+            Self::Running => "🟡",
+            // Two spaces: the same terminal width as the emoji, so columns stay aligned.
+            Self::None => "  ",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
 struct PullRequest {
     title: String,
     url: String,
     updated_at: String,
+    ci: CiStatus,
 }
+
+// Mirrors the shape of the GraphQL response in `list_open_prs`.
+#[derive(Deserialize)]
+struct Response {
+    data: Data,
+}
+
+#[derive(Deserialize)]
+struct Data {
+    search: Search,
+}
+
+#[derive(Deserialize)]
+struct Search {
+    nodes: Vec<PrNode>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrNode {
+    title: String,
+    url: String,
+    updated_at: String,
+    commits: Commits,
+}
+
+#[derive(Deserialize)]
+struct Commits {
+    nodes: Vec<CommitNode>,
+}
+
+#[derive(Deserialize)]
+struct CommitNode {
+    commit: Commit,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Commit {
+    status_check_rollup: Option<Rollup>,
+}
+
+#[derive(Deserialize)]
+struct Rollup {
+    state: String,
+}
+
+impl From<PrNode> for PullRequest {
+    fn from(node: PrNode) -> Self {
+        let state = node
+            .commits
+            .nodes
+            .first()
+            .and_then(|c| c.commit.status_check_rollup.as_ref())
+            .map(|r| r.state.as_str());
+        Self {
+            ci: CiStatus::from_rollup_state(state),
+            title: node.title,
+            url: node.url,
+            updated_at: node.updated_at,
+        }
+    }
+}
+
+// GraphQL rather than `gh search prs`, whose --json can't return CI status.
+// Search works across all repos, unlike `gh pr list` which needs a repo context.
+const QUERY: &str = "query {
+  search(query: \"is:pr is:open author:@me\", type: ISSUE, first: 100) {
+    nodes {
+      ... on PullRequest {
+        title
+        url
+        updatedAt
+        commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+      }
+    }
+  }
+}";
 
 fn gh_installed() -> bool {
     Command::new("gh")
@@ -29,22 +137,28 @@ fn gh_authenticated() -> bool {
 }
 
 fn list_open_prs() -> Result<String, String> {
-    // `gh search` works across all repos, unlike `gh pr list` which needs a repo context.
     let output = Command::new("gh")
-        .args(["search", "prs", "--author", "@me", "--state", "open"])
-        .args(["--json", "title,url,updatedAt"])
+        .args(["api", "graphql", "-f"])
+        .arg(format!("query={QUERY}"))
         .stderr(Stdio::inherit())
         .output()
         .map_err(|e| format!("failed to run gh: {e}"))?;
     if !output.status.success() {
-        return Err("`gh search prs` failed".to_string());
+        return Err("`gh api graphql` failed".to_string());
     }
     String::from_utf8(output.stdout).map_err(|e| format!("gh returned invalid UTF-8: {e}"))
 }
 
 fn parse_prs(json: &str) -> Result<Vec<PullRequest>, String> {
-    let mut prs: Vec<PullRequest> =
+    let response: Response =
         serde_json::from_str(json).map_err(|e| format!("failed to parse gh output: {e}"))?;
+    let mut prs: Vec<PullRequest> = response
+        .data
+        .search
+        .nodes
+        .into_iter()
+        .map(PullRequest::from)
+        .collect();
     // updatedAt is ISO 8601 in UTC, so lexicographic order is chronological.
     prs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     Ok(prs)
@@ -65,10 +179,14 @@ fn format_table(prs: &[PullRequest]) -> String {
         }
     }
 
+    // The CI column is always a single emoji (2 terminal columns, same as the "CI" header),
+    // so it's kept out of the width calculation, which counts chars.
+    let icons = std::iter::once("CI").chain(prs.iter().map(|pr| pr.ci.icon()));
+
     let mut out = String::new();
-    for row in std::iter::once(headers).chain(rows) {
+    for (icon, row) in icons.zip(std::iter::once(headers).chain(rows)) {
         let line = format!(
-            "{:<w0$}  {:<w1$}  {}",
+            "{icon}  {:<w0$}  {:<w1$}  {}",
             row[0],
             row[1],
             row[2],
@@ -108,14 +226,32 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
+    fn pr_node(title: &str, updated_at: &str, state: Option<&str>) -> String {
+        let rollup = match state {
+            Some(s) => format!(r#"{{"state":"{s}"}}"#),
+            None => "null".to_string(),
+        };
+        format!(
+            r#"{{"title":"{title}","url":"https://a/{title}","updatedAt":"{updated_at}",
+                "commits":{{"nodes":[{{"commit":{{"statusCheckRollup":{rollup}}}}}]}}}}"#
+        )
+    }
+
+    fn response(nodes: &[String]) -> String {
+        format!(
+            r#"{{"data":{{"search":{{"nodes":[{}]}}}}}}"#,
+            nodes.join(",")
+        )
+    }
+
     #[test]
     fn parse_prs_sorts_most_recent_first() {
-        let json = r#"[
-            {"title":"old","updatedAt":"2026-01-01T00:00:00Z","url":"https://a/1"},
-            {"title":"new","updatedAt":"2026-09-24T20:16:53Z","url":"https://a/2"},
-            {"title":"mid","updatedAt":"2026-07-31T10:37:06Z","url":"https://a/3"}
-        ]"#;
-        let titles: Vec<_> = parse_prs(json)
+        let json = response(&[
+            pr_node("old", "2026-01-01T00:00:00Z", None),
+            pr_node("new", "2026-09-24T20:16:53Z", None),
+            pr_node("mid", "2026-07-31T10:37:06Z", None),
+        ]);
+        let titles: Vec<_> = parse_prs(&json)
             .unwrap()
             .into_iter()
             .map(|pr| pr.title)
@@ -124,8 +260,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_prs_ci_status() {
+        let json = response(&[
+            pr_node("a", "2026-01-06T00:00:00Z", Some("SUCCESS")),
+            pr_node("b", "2026-01-05T00:00:00Z", Some("FAILURE")),
+            pr_node("c", "2026-01-04T00:00:00Z", Some("ERROR")),
+            pr_node("d", "2026-01-03T00:00:00Z", Some("PENDING")),
+            pr_node("e", "2026-01-02T00:00:00Z", Some("EXPECTED")),
+            pr_node("f", "2026-01-01T00:00:00Z", None),
+        ]);
+        let statuses: Vec<_> = parse_prs(&json)
+            .unwrap()
+            .into_iter()
+            .map(|pr| pr.ci)
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                CiStatus::Success,
+                CiStatus::Failure,
+                CiStatus::Failure,
+                CiStatus::Running,
+                CiStatus::Running,
+                CiStatus::None,
+            ]
+        );
+    }
+
+    #[test]
     fn parse_prs_empty() {
-        assert!(parse_prs("[]").unwrap().is_empty());
+        assert!(parse_prs(&response(&[])).unwrap().is_empty());
     }
 
     #[test]
@@ -140,17 +304,19 @@ mod tests {
                 title: "short".into(),
                 url: "https://a/1".into(),
                 updated_at: "2026-09-24T20:16:53Z".into(),
+                ci: CiStatus::Success,
             },
             PullRequest {
                 title: "a longer title".into(),
                 url: "https://a/22".into(),
                 updated_at: "2026-07-31T10:37:06Z".into(),
+                ci: CiStatus::Running,
             },
         ];
         let expected = "\
-TITLE           URL           LAST UPDATED
-short           https://a/1   2026-09-24T20:16:53Z
-a longer title  https://a/22  2026-07-31T10:37:06Z
+CI  TITLE           URL           LAST UPDATED
+🟢  short           https://a/1   2026-09-24T20:16:53Z
+🟡  a longer title  https://a/22  2026-07-31T10:37:06Z
 ";
         assert_eq!(format_table(&prs), expected);
     }
