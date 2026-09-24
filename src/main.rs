@@ -41,6 +41,7 @@ struct PullRequest {
     url: String,
     updated_at: String,
     ci: CiStatus,
+    is_draft: bool,
 }
 
 // Mirrors the shape of the GraphQL response in `list_open_prs`.
@@ -66,6 +67,7 @@ struct PrNode {
     title: String,
     url: String,
     updated_at: String,
+    is_draft: bool,
     commits: Commits,
 }
 
@@ -115,6 +117,7 @@ impl From<PrNode> for PullRequest {
             title: node.title,
             url: node.url,
             updated_at: node.updated_at,
+            is_draft: node.is_draft,
         }
     }
 }
@@ -129,6 +132,7 @@ const QUERY: &str = "query {
         title
         url
         updatedAt
+        isDraft
         commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
       }
     }
@@ -251,8 +255,11 @@ fn relative_time(timestamp: &str, now: DateTime<Utc>) -> String {
     }
 }
 
-/// Release PRs are opened by bots and tend to linger; hide them once they're stale.
 fn is_hidden(pr: &PullRequest, now: DateTime<Utc>) -> bool {
+    if pr.is_draft {
+        return true;
+    }
+    // Release PRs are opened by bots and tend to linger; hide them once they're stale.
     let Ok(updated) = DateTime::parse_from_rfc3339(&pr.updated_at) else {
         return false;
     };
@@ -354,7 +361,7 @@ mod tests {
             None => "null".to_string(),
         };
         format!(
-            r#"{{"repository":{{"nameWithOwner":"o/r"}},"title":"{title}","url":"https://a/{title}","updatedAt":"{updated_at}",
+            r#"{{"repository":{{"nameWithOwner":"o/r"}},"title":"{title}","url":"https://a/{title}","updatedAt":"{updated_at}","isDraft":false,
                 "commits":{{"nodes":[{{"commit":{{"statusCheckRollup":{rollup}}}}}]}}}}"#
         )
     }
@@ -430,6 +437,7 @@ mod tests {
             url: "https://a/1".into(),
             updated_at: updated_at.into(),
             ci: CiStatus::None,
+            is_draft: false,
         }
     }
 
@@ -465,6 +473,22 @@ mod tests {
     }
 
     #[test]
+    fn filter_prs_hides_drafts() {
+        let prs = vec![
+            PullRequest {
+                is_draft: true,
+                ..pr("draft", "2026-09-24T20:00:00Z")
+            },
+            pr("ready", "2026-09-24T20:00:00Z"),
+        ];
+        let titles: Vec<_> = filter_prs(prs, now())
+            .into_iter()
+            .map(|pr| pr.title)
+            .collect();
+        assert_eq!(titles, ["ready"]);
+    }
+
+    #[test]
     fn relative_time_rounds_to_largest_unit() {
         let cases = [
             ("2026-09-24T20:59:50Z", "now"),
@@ -490,6 +514,7 @@ mod tests {
                 url: "https://a/1".into(),
                 updated_at: "2026-09-24T20:16:53Z".into(),
                 ci: CiStatus::Success,
+                is_draft: false,
             },
             PullRequest {
                 repo: "o/r".into(),
@@ -497,6 +522,7 @@ mod tests {
                 url: "https://a/22".into(),
                 updated_at: "2026-07-31T10:37:06Z".into(),
                 ci: CiStatus::Running,
+                is_draft: false,
             },
         ];
         let expected = "\
