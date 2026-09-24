@@ -42,6 +42,15 @@ struct PullRequest {
     updated_at: String,
     ci: CiStatus,
     is_draft: bool,
+    /// Failed or running checks; only fetched with `--actions`.
+    checks: Vec<Check>,
+}
+
+#[derive(Debug, PartialEq)]
+struct Check {
+    name: String,
+    ci: CiStatus,
+    url: String,
 }
 
 // Mirrors the shape of the GraphQL response in `list_open_prs`.
@@ -96,6 +105,96 @@ struct Commit {
 #[derive(Deserialize)]
 struct Rollup {
     state: String,
+    /// Absent unless the query asked for it.
+    contexts: Option<Contexts>,
+}
+
+#[derive(Deserialize)]
+struct Contexts {
+    nodes: Vec<CheckContext>,
+}
+
+// GitHub Actions jobs are CheckRuns; StatusContexts come from external CI via the statuses API.
+#[derive(Deserialize)]
+#[serde(tag = "__typename", rename_all_fields = "camelCase")]
+enum CheckContext {
+    CheckRun {
+        name: String,
+        status: String,
+        conclusion: Option<String>,
+        details_url: Option<String>,
+        check_suite: Option<CheckSuite>,
+    },
+    StatusContext {
+        context: String,
+        state: String,
+        target_url: Option<String>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckSuite {
+    workflow_run: Option<WorkflowRun>,
+}
+
+#[derive(Deserialize)]
+struct WorkflowRun {
+    workflow: Workflow,
+}
+
+#[derive(Deserialize)]
+struct Workflow {
+    name: String,
+}
+
+impl From<CheckContext> for Check {
+    fn from(context: CheckContext) -> Self {
+        match context {
+            CheckContext::CheckRun {
+                name,
+                status,
+                conclusion,
+                details_url,
+                check_suite,
+            } => {
+                let ci = match (status.as_str(), conclusion.as_deref()) {
+                    ("COMPLETED", Some("SUCCESS" | "NEUTRAL" | "SKIPPED" | "STALE")) => {
+                        CiStatus::Success
+                    }
+                    // Usually fail-fast cancelling sibling jobs after one failed, so it's noise.
+                    ("COMPLETED", Some("CANCELLED")) => CiStatus::None,
+                    ("COMPLETED", _) => CiStatus::Failure,
+                    _ => CiStatus::Running,
+                };
+                // Job names like "build" are ambiguous across workflows, so prefix the workflow.
+                let mut name = match check_suite.and_then(|s| s.workflow_run) {
+                    Some(run) => format!("{} / {name}", run.workflow.name),
+                    None => name,
+                };
+                // A plain failure needs no explanation; the rarer conclusions do.
+                if let (CiStatus::Failure, Some(c)) = (ci, conclusion.as_deref())
+                    && c != "FAILURE"
+                {
+                    name = format!("{name} ({})", c.to_lowercase().replace('_', " "));
+                }
+                Self {
+                    name,
+                    ci,
+                    url: details_url.unwrap_or_default(),
+                }
+            }
+            CheckContext::StatusContext {
+                context,
+                state,
+                target_url,
+            } => Self {
+                name: context,
+                ci: CiStatus::from_rollup_state(Some(&state)),
+                url: target_url.unwrap_or_default(),
+            },
+        }
+    }
 }
 
 impl Commits {
@@ -106,6 +205,24 @@ impl Commits {
             .and_then(|c| c.commit.status_check_rollup.as_ref())
             .map(|r| r.state.as_str());
         CiStatus::from_rollup_state(state)
+    }
+
+    fn failed_or_running_checks(self) -> Vec<Check> {
+        let contexts = self
+            .nodes
+            .into_iter()
+            .next()
+            .and_then(|c| c.commit.status_check_rollup)
+            .and_then(|r| r.contexts)
+            .map_or_else(Vec::new, |c| c.nodes);
+        let mut checks: Vec<Check> = contexts
+            .into_iter()
+            .map(Check::from)
+            .filter(|c| matches!(c.ci, CiStatus::Failure | CiStatus::Running))
+            .collect();
+        // Stable sort: failures first, otherwise keep GitHub's order.
+        checks.sort_by_key(|c| c.ci != CiStatus::Failure);
+        checks
     }
 }
 
@@ -118,6 +235,7 @@ impl From<PrNode> for PullRequest {
             url: node.url,
             updated_at: node.updated_at,
             is_draft: node.is_draft,
+            checks: node.commits.failed_or_running_checks(),
         }
     }
 }
@@ -133,9 +251,22 @@ const QUERY: &str = "query {
         url
         updatedAt
         isDraft
-        commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+        commits(last: 1) { nodes { commit { statusCheckRollup { state CONTEXTS } } } }
       }
     }
+  }
+}";
+
+// Substituted into QUERY for `--actions`. Plain text substitution rather than
+// `@include(if: $var)` because `gh_graphql` only passes string variables.
+const CONTEXTS: &str = "contexts(first: 100) {
+  nodes {
+    __typename
+    ... on CheckRun {
+      name status conclusion detailsUrl
+      checkSuite { workflowRun { workflow { name } } }
+    }
+    ... on StatusContext { context state targetUrl }
   }
 }";
 
@@ -287,8 +418,9 @@ fn gh_graphql(query: &str, vars: &[(&str, &str)]) -> Result<String, String> {
     String::from_utf8(output.stdout).map_err(|e| format!("gh returned invalid UTF-8: {e}"))
 }
 
-fn list_open_prs() -> Result<String, String> {
-    gh_graphql(QUERY, &[])
+fn list_open_prs(with_checks: bool) -> Result<String, String> {
+    let contexts = if with_checks { CONTEXTS } else { "" };
+    gh_graphql(&QUERY.replace("CONTEXTS", contexts), &[])
 }
 
 fn parse_prs(json: &str) -> Result<Vec<PullRequest>, String> {
@@ -362,7 +494,10 @@ fn format_table(prs: &[PullRequest], now: DateTime<Utc>) -> String {
     let icons = std::iter::once("CI").chain(prs.iter().map(|pr| pr.ci.icon()));
 
     let mut out = String::new();
-    for (icon, row) in icons.zip(std::iter::once(headers).chain(rows)) {
+    for ((icon, row), checks) in icons
+        .zip(std::iter::once(headers).chain(rows))
+        .zip(std::iter::once(&[][..]).chain(prs.iter().map(|pr| &pr.checks[..])))
+    {
         out.push_str(icon);
         for (cell, w) in row.iter().zip(widths) {
             out.push_str(&format!("  {cell:<w$}"));
@@ -370,6 +505,15 @@ fn format_table(prs: &[PullRequest], now: DateTime<Utc>) -> String {
         // Last column is padded too; don't leave trailing spaces.
         out.truncate(out.trim_end().len());
         out.push('\n');
+
+        // Indented under the REPO column.
+        let name_width = checks.iter().map(|c| c.name.chars().count()).max();
+        for check in checks {
+            let w = name_width.unwrap_or(0);
+            let line = format!("    {} {:<w$}  {}", check.ci.icon(), check.name, check.url);
+            out.push_str(line.trim_end());
+            out.push('\n');
+        }
     }
     out
 }
@@ -387,17 +531,12 @@ fn main() -> ExitCode {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.as_slice() {
-        [] => list_open_prs()
-            .and_then(|json| parse_prs(&json))
-            .map(|prs| {
-                let now = Utc::now();
-                let prs = filter_prs(prs, now);
-                print!("{}", format_table(&prs, now));
-            }),
+        [] => list(false),
+        [flag] if flag == "--actions" => list(true),
         [cmd, url] if cmd == "merge" => merge_pr(url),
         [cmd, url] if cmd == "rebase" => rebase_pr(url),
         _ => {
-            eprintln!("usage: gh_wrapper [merge <pr-url> | rebase <pr-url>]");
+            eprintln!("usage: gh_wrapper [--actions | merge <pr-url> | rebase <pr-url>]");
             return ExitCode::FAILURE;
         }
     };
@@ -409,6 +548,14 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn list(with_checks: bool) -> Result<(), String> {
+    let prs = parse_prs(&list_open_prs(with_checks)?)?;
+    let now = Utc::now();
+    let prs = filter_prs(prs, now);
+    print!("{}", format_table(&prs, now));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -498,6 +645,7 @@ mod tests {
             updated_at: updated_at.into(),
             ci: CiStatus::None,
             is_draft: false,
+            checks: vec![],
         }
     }
 
@@ -587,6 +735,7 @@ mod tests {
                 updated_at: "2026-09-24T20:16:53Z".into(),
                 ci: CiStatus::Success,
                 is_draft: false,
+                checks: vec![],
             },
             PullRequest {
                 repo: "o/r".into(),
@@ -595,13 +744,64 @@ mod tests {
                 updated_at: "2026-07-31T10:37:06Z".into(),
                 ci: CiStatus::Running,
                 is_draft: false,
+                checks: vec![
+                    Check {
+                        name: "CI / build".into(),
+                        ci: CiStatus::Failure,
+                        url: "https://a/job/1".into(),
+                    },
+                    Check {
+                        name: "lint".into(),
+                        ci: CiStatus::Running,
+                        url: "".into(),
+                    },
+                ],
             },
         ];
         let expected = "\
 CI  REPO                TITLE           URL           LAST UPDATED
 🟢  KDAB/KDDockWidgets  short           https://a/1   43 minutes ago
 🟡  o/r                 a longer title  https://a/22  2 months ago
+    🔴 CI / build  https://a/job/1
+    🟡 lint
 ";
         assert_eq!(format_table(&prs, now()), expected);
+    }
+
+    #[test]
+    fn parse_prs_keeps_only_failed_or_running_checks() {
+        let json = r#"{"data":{"search":{"nodes":[{"repository":{"nameWithOwner":"o/r"},
+            "title":"t","url":"https://a/1","updatedAt":"2026-01-01T00:00:00Z","isDraft":false,
+            "commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"FAILURE","contexts":{"nodes":[
+                {"__typename":"CheckRun","name":"ok","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"u1","checkSuite":null},
+                {"__typename":"CheckRun","name":"skipped","status":"COMPLETED","conclusion":"SKIPPED","detailsUrl":"u2","checkSuite":null},
+                {"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"TIMED_OUT","detailsUrl":"u3",
+                    "checkSuite":{"workflowRun":{"workflow":{"name":"CI"}}}},
+                {"__typename":"CheckRun","name":"cancelled","status":"COMPLETED","conclusion":"CANCELLED","detailsUrl":"u6","checkSuite":null},
+                {"__typename":"CheckRun","name":"test","status":"QUEUED","conclusion":null,"detailsUrl":null,"checkSuite":null},
+                {"__typename":"StatusContext","context":"ext/ci","state":"ERROR","targetUrl":"u5"},
+                {"__typename":"StatusContext","context":"ext/ok","state":"SUCCESS","targetUrl":null}
+            ]}}}}]}}]}}}"#;
+        let prs = parse_prs(json).unwrap();
+        assert_eq!(
+            prs[0].checks,
+            [
+                Check {
+                    name: "CI / build (timed out)".into(),
+                    ci: CiStatus::Failure,
+                    url: "u3".into(),
+                },
+                Check {
+                    name: "ext/ci".into(),
+                    ci: CiStatus::Failure,
+                    url: "u5".into(),
+                },
+                Check {
+                    name: "test".into(),
+                    ci: CiStatus::Running,
+                    url: "".into(),
+                },
+            ]
+        );
     }
 }
