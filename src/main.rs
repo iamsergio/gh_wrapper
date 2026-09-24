@@ -139,9 +139,12 @@ const QUERY: &str = "query {
   }
 }";
 
-const PR_CI_QUERY: &str = "query($url: URI!) {
+const PR_INFO_QUERY: &str = "query($url: URI!) {
   resource(url: $url) {
     ... on PullRequest {
+      headRefName
+      headRefOid
+      headRepository { nameWithOwner }
       commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
     }
   }
@@ -157,40 +160,84 @@ struct ResourceData {
     resource: Option<Resource>,
 }
 
-// Non-PR resources match no fragment and deserialize as `{}`, i.e. `commits: None`.
+// Non-PR resources match no fragment and deserialize as `{}`, so every field is optional.
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Resource {
+    head_ref_name: Option<String>,
+    head_ref_oid: Option<String>,
+    head_repository: Option<Repository>,
     commits: Option<Commits>,
 }
 
-fn parse_pr_ci(json: &str) -> Result<CiStatus, String> {
+#[derive(Debug, PartialEq)]
+struct PrInfo {
+    ci: CiStatus,
+    head_branch: String,
+    head_oid: String,
+    /// None if the head repository (e.g. a fork) was deleted.
+    head_repo: Option<String>,
+}
+
+fn parse_pr_info(json: &str) -> Result<PrInfo, String> {
     let response: ResourceResponse =
         serde_json::from_str(json).map_err(|e| format!("failed to parse gh output: {e}"))?;
-    response
-        .data
-        .resource
-        .and_then(|r| r.commits)
-        .map(|c| c.ci_status())
-        .ok_or_else(|| "not a pull request URL".to_string())
+    let not_a_pr = || "not a pull request URL".to_string();
+    let resource = response.data.resource.ok_or_else(not_a_pr)?;
+    Ok(PrInfo {
+        ci: resource.commits.ok_or_else(not_a_pr)?.ci_status(),
+        head_branch: resource.head_ref_name.ok_or_else(not_a_pr)?,
+        head_oid: resource.head_ref_oid.ok_or_else(not_a_pr)?,
+        head_repo: resource.head_repository.map(|r| r.name_with_owner),
+    })
 }
 
 fn merge_pr(url: &str) -> Result<(), String> {
-    let ci = parse_pr_ci(&gh_graphql(PR_CI_QUERY, &[("url", url)])?)?;
-    match ci {
+    let pr = parse_pr_info(&gh_graphql(PR_INFO_QUERY, &[("url", url)])?)?;
+    match pr.ci {
         CiStatus::Success => {}
         CiStatus::Failure => return Err("CI failed, not merging".to_string()),
         CiStatus::Running => return Err("CI is still running, not merging".to_string()),
         CiStatus::None => return Err("PR has no CI checks, not merging".to_string()),
     }
-    // Stdio is inherited so gh can prompt for the merge method.
+
+    // Passing a merge method makes gh non-interactive. --delete-branch isn't used because it
+    // also deletes the local branch; the remote one is deleted below instead.
+    // --match-head-commit refuses the merge if someone pushed after the CI check above.
     let status = Command::new("gh")
-        .args(["pr", "merge", url])
+        .args(["pr", "merge", url, "--rebase", "--match-head-commit"])
+        .arg(&pr.head_oid)
         .status()
         .map_err(|e| format!("failed to run gh: {e}"))?;
     if !status.success() {
         return Err("`gh pr merge` failed".to_string());
     }
+
+    if let Some(repo) = &pr.head_repo {
+        delete_remote_branch(repo, &pr.head_branch);
+    }
     Ok(())
+}
+
+/// Best effort: the PR is already merged, so failures are only warnings.
+fn delete_remote_branch(repo: &str, branch: &str) {
+    let output = Command::new("gh")
+        .args(["api", "-X", "DELETE"])
+        .arg(format!("repos/{repo}/git/refs/heads/{branch}"))
+        .output();
+    match output {
+        Ok(o) if o.status.success() => println!("Deleted remote branch {repo}:{branch}"),
+        // The repo's "automatically delete head branches" setting may have beaten us to it.
+        Ok(o)
+            if [&o.stdout, &o.stderr]
+                .iter()
+                .any(|out| String::from_utf8_lossy(out).contains("Reference does not exist")) => {}
+        Ok(o) => eprintln!(
+            "warning: failed to delete remote branch {repo}:{branch}: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => eprintln!("warning: failed to run gh: {e}"),
+    }
 }
 
 fn gh_installed() -> bool {
@@ -456,20 +503,32 @@ mod tests {
     }
 
     #[test]
-    fn parse_pr_ci_states() {
-        let json = r#"{"data":{"resource":{"commits":{"nodes":[
-            {"commit":{"statusCheckRollup":{"state":"SUCCESS"}}}]}}}}"#;
-        assert_eq!(parse_pr_ci(json), Ok(CiStatus::Success));
+    fn parse_pr_info_reads_head_and_ci() {
+        let json = r#"{"data":{"resource":{"headRefName":"feat/x","headRefOid":"abc123",
+            "headRepository":{"nameWithOwner":"o/r"},
+            "commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"SUCCESS"}}}]}}}}"#;
+        assert_eq!(
+            parse_pr_info(json),
+            Ok(PrInfo {
+                ci: CiStatus::Success,
+                head_branch: "feat/x".into(),
+                head_oid: "abc123".into(),
+                head_repo: Some("o/r".into()),
+            })
+        );
 
-        let json = r#"{"data":{"resource":{"commits":{"nodes":[
-            {"commit":{"statusCheckRollup":null}}]}}}}"#;
-        assert_eq!(parse_pr_ci(json), Ok(CiStatus::None));
+        let json = r#"{"data":{"resource":{"headRefName":"feat/x","headRefOid":"abc123",
+            "headRepository":null,
+            "commits":{"nodes":[{"commit":{"statusCheckRollup":null}}]}}}}"#;
+        let pr = parse_pr_info(json).unwrap();
+        assert_eq!(pr.ci, CiStatus::None);
+        assert_eq!(pr.head_repo, None);
     }
 
     #[test]
-    fn parse_pr_ci_rejects_non_pr_urls() {
-        assert!(parse_pr_ci(r#"{"data":{"resource":null}}"#).is_err());
-        assert!(parse_pr_ci(r#"{"data":{"resource":{}}}"#).is_err());
+    fn parse_pr_info_rejects_non_pr_urls() {
+        assert!(parse_pr_info(r#"{"data":{"resource":null}}"#).is_err());
+        assert!(parse_pr_info(r#"{"data":{"resource":{}}}"#).is_err());
     }
 
     #[test]

@@ -11,7 +11,7 @@ Startup sequence in `src/main.rs`:
 2. `gh auth status` — exit 1 and print `gh auth login` if not authenticated.
 3. `gh api graphql` searching `is:pr is:open author:@me` — fetches repo (`nameWithOwner`), title, URL, `updatedAt`, `isDraft` and the head commit's `statusCheckRollup` state; JSON is parsed with serde, sorted by `updatedAt` descending, and printed as a table with relative dates via `chrono-humanize` (e.g. "2 months ago"); draft PRs, and PRs titled `chore: release…` not updated in 30+ days, are hidden (one row per PR) with a CI column (🟢 success, 🔴 failure/error, 🟡 pending, blank if no checks). GraphQL is used because `gh search prs --json` can't return CI status, and a search is used instead of `gh pr list` because the latter requires being inside a repo.
 
-`gh_wrapper merge <pr-url>` instead looks up the PR's CI via a GraphQL `resource(url:)` query and runs `gh pr merge <url>` (stdio inherited, so gh prompts for the merge method) only if CI is green; failed, running or missing CI aborts with exit 1.
+`gh_wrapper merge <pr-url>` instead looks up the PR's CI and head branch/commit via a GraphQL `resource(url:)` query and, only if CI is green, runs `gh pr merge <url> --rebase --match-head-commit <oid>` (non-interactive), then deletes the remote head branch via `gh api -X DELETE repos/…/git/refs/heads/…`. `--delete-branch` isn't used because it also deletes the local branch, which we keep. Failed, running or missing CI aborts with exit 1.
 
 ## Commands
 
