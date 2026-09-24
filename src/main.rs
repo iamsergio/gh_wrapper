@@ -1,5 +1,7 @@
 use std::process::{Command, ExitCode, Stdio};
 
+use chrono::{DateTime, Utc};
+use chrono_humanize::HumanTime;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -174,16 +176,29 @@ fn parse_prs(json: &str) -> Result<Vec<PullRequest>, String> {
     Ok(prs)
 }
 
-fn format_table(prs: &[PullRequest]) -> String {
+/// e.g. "an hour ago", "3 months ago". Falls back to the raw string if it isn't RFC 3339.
+fn relative_time(timestamp: &str, now: DateTime<Utc>) -> String {
+    match DateTime::parse_from_rfc3339(timestamp) {
+        Ok(t) => HumanTime::from(t.with_timezone(&Utc) - now).to_string(),
+        Err(_) => timestamp.to_string(),
+    }
+}
+
+fn format_table(prs: &[PullRequest], now: DateTime<Utc>) -> String {
     let headers = ["REPO", "TITLE", "URL", "LAST UPDATED"];
+    let updated: Vec<String> = prs
+        .iter()
+        .map(|pr| relative_time(&pr.updated_at, now))
+        .collect();
     let rows: Vec<[&str; 4]> = prs
         .iter()
-        .map(|pr| {
+        .zip(&updated)
+        .map(|(pr, updated)| {
             [
                 pr.repo.as_str(),
                 pr.title.as_str(),
                 pr.url.as_str(),
-                pr.updated_at.as_str(),
+                updated.as_str(),
             ]
         })
         .collect();
@@ -226,7 +241,7 @@ fn main() -> ExitCode {
 
     match list_open_prs().and_then(|json| parse_prs(&json)) {
         Ok(prs) => {
-            print!("{}", format_table(&prs));
+            print!("{}", format_table(&prs, Utc::now()));
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -311,6 +326,27 @@ mod tests {
         assert!(parse_prs("not json").is_err());
     }
 
+    fn now() -> DateTime<Utc> {
+        "2026-09-24T21:00:00Z".parse().unwrap()
+    }
+
+    #[test]
+    fn relative_time_rounds_to_largest_unit() {
+        let cases = [
+            ("2026-09-24T20:59:50Z", "now"),
+            ("2026-09-24T20:16:53Z", "43 minutes ago"),
+            ("2026-09-24T19:00:00Z", "2 hours ago"),
+            ("2026-09-23T20:00:00Z", "a day ago"),
+            ("2026-09-10T20:00:00Z", "2 weeks ago"),
+            ("2026-07-31T10:37:06Z", "2 months ago"),
+            ("2024-10-26T22:03:57Z", "2 years ago"),
+            ("garbage", "garbage"),
+        ];
+        for (timestamp, expected) in cases {
+            assert_eq!(relative_time(timestamp, now()), expected, "{timestamp}");
+        }
+    }
+
     #[test]
     fn format_table_aligns_columns() {
         let prs = [
@@ -331,9 +367,9 @@ mod tests {
         ];
         let expected = "\
 CI  REPO                TITLE           URL           LAST UPDATED
-🟢  KDAB/KDDockWidgets  short           https://a/1   2026-09-24T20:16:53Z
-🟡  o/r                 a longer title  https://a/22  2026-07-31T10:37:06Z
+🟢  KDAB/KDDockWidgets  short           https://a/1   43 minutes ago
+🟡  o/r                 a longer title  https://a/22  2 months ago
 ";
-        assert_eq!(format_table(&prs), expected);
+        assert_eq!(format_table(&prs, now()), expected);
     }
 }
