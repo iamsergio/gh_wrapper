@@ -37,6 +37,7 @@ impl CiStatus {
 #[derive(Debug, PartialEq)]
 struct PullRequest {
     repo: String,
+    author: String,
     title: String,
     url: String,
     updated_at: String,
@@ -62,6 +63,8 @@ struct Response {
 #[derive(Deserialize)]
 struct Data {
     search: Search,
+    /// Absent unless the query asked for it.
+    watched: Option<Search>,
 }
 
 #[derive(Deserialize)]
@@ -73,6 +76,8 @@ struct Search {
 #[serde(rename_all = "camelCase")]
 struct PrNode {
     repository: Repository,
+    /// Null for deleted accounts.
+    author: Option<Author>,
     title: String,
     url: String,
     updated_at: String,
@@ -84,6 +89,11 @@ struct PrNode {
 #[serde(rename_all = "camelCase")]
 struct Repository {
     name_with_owner: String,
+}
+
+#[derive(Deserialize)]
+struct Author {
+    login: String,
 }
 
 #[derive(Deserialize)]
@@ -231,6 +241,7 @@ impl From<PrNode> for PullRequest {
         Self {
             ci: node.commits.ci_status(),
             repo: node.repository.name_with_owner,
+            author: node.author.map_or_else(|| "ghost".to_string(), |a| a.login),
             title: node.title,
             url: node.url,
             updated_at: node.updated_at,
@@ -244,18 +255,51 @@ impl From<PrNode> for PullRequest {
 // Search works across all repos, unlike `gh pr list` which needs a repo context.
 const QUERY: &str = "query {
   search(query: \"is:pr is:open author:@me\", type: ISSUE, first: 100) {
-    nodes {
-      ... on PullRequest {
-        repository { nameWithOwner }
-        title
-        url
-        updatedAt
-        isDraft
-        commits(last: 1) { nodes { commit { statusCheckRollup { state CONTEXTS } } } }
-      }
-    }
+    nodes { ...Pr }
   }
+  WATCHED
+}
+fragment Pr on PullRequest {
+  repository { nameWithOwner }
+  author { login }
+  title
+  url
+  updatedAt
+  isDraft
+  commits(last: 1) { nodes { commit { statusCheckRollup { state CONTEXTS } } } }
 }";
+
+/// How recently a watched repo's PR must have been opened to be listed.
+const WATCHED_MAX_AGE: TimeDelta = TimeDelta::weeks(3);
+
+/// Search has no "repos I watch" qualifier, so they're listed as `repo:` qualifiers.
+/// Fetching each watched repo's PRs through GraphQL instead times out (HTTP 504).
+fn watched_search(repos: &[String], now: DateTime<Utc>) -> String {
+    let since = (now - WATCHED_MAX_AGE).format("%Y-%m-%d");
+    let repos: String = repos.iter().map(|r| format!(" repo:{r}")).collect();
+    format!(
+        "watched: search(query: \"is:pr is:open -author:@me created:>={since}{repos}\", \
+         type: ISSUE, first: 100) {{ nodes {{ ...Pr }} }}"
+    )
+}
+
+/// Full names (owner/repo) of the repos the user watches. REST rather than GraphQL's
+/// `viewer.watching`, which is twice as slow.
+fn watched_repos() -> Result<Vec<String>, String> {
+    let output = Command::new("gh")
+        .args(["api", "user/subscriptions?per_page=100", "--paginate"])
+        .args(["--jq", ".[].full_name"])
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|e| format!("failed to run gh: {e}"))?;
+    if !output.status.success() {
+        return Err("`gh api user/subscriptions` failed".to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect())
+}
 
 // Substituted into QUERY for `--actions`. Plain text substitution rather than
 // `@include(if: $var)` because `gh_graphql` only passes string variables.
@@ -454,19 +498,23 @@ fn gh_graphql(query: &str, vars: &[(&str, &str)]) -> Result<String, String> {
     String::from_utf8(output.stdout).map_err(|e| format!("gh returned invalid UTF-8: {e}"))
 }
 
-fn list_open_prs(with_checks: bool) -> Result<String, String> {
+/// `watched` is the substitution for QUERY's WATCHED placeholder, see `watched_search`.
+fn list_open_prs(with_checks: bool, watched: &str) -> Result<String, String> {
     let contexts = if with_checks { CONTEXTS } else { "" };
-    gh_graphql(&QUERY.replace("CONTEXTS", contexts), &[])
+    let query = QUERY
+        .replace("CONTEXTS", contexts)
+        .replace("WATCHED", watched);
+    gh_graphql(&query, &[])
 }
 
 fn parse_prs(json: &str) -> Result<Vec<PullRequest>, String> {
     let response: Response =
         serde_json::from_str(json).map_err(|e| format!("failed to parse gh output: {e}"))?;
-    let mut prs: Vec<PullRequest> = response
-        .data
-        .search
+    let Data { search, watched } = response.data;
+    let mut prs: Vec<PullRequest> = search
         .nodes
         .into_iter()
+        .chain(watched.into_iter().flat_map(|w| w.nodes))
         .map(PullRequest::from)
         .collect();
     // updatedAt is ISO 8601 in UTC, so lexicographic order is chronological.
@@ -500,8 +548,11 @@ fn filter_prs(prs: Vec<PullRequest>, now: DateTime<Utc>, show_drafts: bool) -> V
         .collect()
 }
 
-fn format_table(prs: &[PullRequest], now: DateTime<Utc>) -> String {
-    let headers = ["REPO", "TITLE", "URL", "LAST UPDATED"];
+fn format_table(prs: &[PullRequest], now: DateTime<Utc>, show_author: bool) -> String {
+    let mut headers = vec!["REPO", "TITLE", "URL", "LAST UPDATED"];
+    if show_author {
+        headers.insert(1, "AUTHOR");
+    }
     let updated: Vec<String> = prs
         .iter()
         .map(|pr| relative_time(&pr.updated_at, now))
@@ -513,22 +564,26 @@ fn format_table(prs: &[PullRequest], now: DateTime<Utc>) -> String {
             false => pr.title.clone(),
         })
         .collect();
-    let rows: Vec<[&str; 4]> = prs
+    let rows: Vec<Vec<&str>> = prs
         .iter()
         .zip(&updated)
         .zip(&titles)
         .map(|((pr, updated), title)| {
-            [
+            let mut row = vec![
                 pr.repo.as_str(),
                 title.as_str(),
                 pr.url.as_str(),
                 updated.as_str(),
-            ]
+            ];
+            if show_author {
+                row.insert(1, pr.author.as_str());
+            }
+            row
         })
         .collect();
 
     // Width in chars rather than bytes, so non-ASCII titles stay aligned.
-    let mut widths = headers.map(|h| h.chars().count());
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
     for row in &rows {
         for (w, cell) in widths.iter_mut().zip(row) {
             *w = (*w).max(cell.chars().count());
@@ -545,7 +600,7 @@ fn format_table(prs: &[PullRequest], now: DateTime<Utc>) -> String {
         .zip(std::iter::once(&[][..]).chain(prs.iter().map(|pr| &pr.checks[..])))
     {
         out.push_str(icon);
-        for (cell, w) in row.iter().zip(widths) {
+        for (cell, &w) in row.iter().zip(&widths) {
             out.push_str(&format!("  {cell:<w$}"));
         }
         // Last column is padded too; don't leave trailing spaces.
@@ -580,13 +635,18 @@ fn main() -> ExitCode {
         [cmd, url] if cmd == "merge" => merge_pr(url),
         [cmd, url] if cmd == "rebase" => rebase_pr(url),
         [cmd, branch] if cmd == "pr" => create_pr(branch),
-        flags if flags.iter().all(|f| f == "--actions" || f == "--draft") => list(
-            flags.iter().any(|f| f == "--actions"),
-            flags.iter().any(|f| f == "--draft"),
-        ),
+        flags
+            if flags
+                .iter()
+                .all(|f| ["--actions", "--draft", "--watched"].contains(&f.as_str())) =>
+        {
+            let has = |flag| flags.iter().any(|f| f == flag);
+            list(has("--actions"), has("--draft"), has("--watched"))
+        }
         _ => {
             eprintln!(
-                "usage: gh_wrapper [--actions] [--draft] | merge <pr-url> | rebase <pr-url> | pr <branch>"
+                "usage: gh_wrapper [--actions] [--draft] [--watched] | merge <pr-url> | rebase <pr-url> \
+                 | pr <branch>"
             );
             return ExitCode::FAILURE;
         }
@@ -601,11 +661,21 @@ fn main() -> ExitCode {
     }
 }
 
-fn list(with_checks: bool, show_drafts: bool) -> Result<(), String> {
-    let prs = parse_prs(&list_open_prs(with_checks)?)?;
+fn list(with_checks: bool, show_drafts: bool, with_watched: bool) -> Result<(), String> {
     let now = Utc::now();
+    let repos = if with_watched {
+        watched_repos()?
+    } else {
+        vec![]
+    };
+    // With no `repo:` qualifier the search would cover all of GitHub.
+    let watched = match repos.is_empty() {
+        true => String::new(),
+        false => watched_search(&repos, now),
+    };
+    let prs = parse_prs(&list_open_prs(with_checks, &watched)?)?;
     let prs = filter_prs(prs, now, show_drafts);
-    print!("{}", format_table(&prs, now));
+    print!("{}", format_table(&prs, now, with_watched));
     Ok(())
 }
 
@@ -619,7 +689,7 @@ mod tests {
             None => "null".to_string(),
         };
         format!(
-            r#"{{"repository":{{"nameWithOwner":"o/r"}},"title":"{title}","url":"https://a/{title}","updatedAt":"{updated_at}","isDraft":false,
+            r#"{{"repository":{{"nameWithOwner":"o/r"}},"author":{{"login":"me"}},"title":"{title}","url":"https://a/{title}","updatedAt":"{updated_at}","isDraft":false,
                 "commits":{{"nodes":[{{"commit":{{"statusCheckRollup":{rollup}}}}}]}}}}"#
         )
     }
@@ -691,6 +761,7 @@ mod tests {
     fn pr(title: &str, updated_at: &str) -> PullRequest {
         PullRequest {
             repo: "o/r".into(),
+            author: "me".into(),
             title: title.into(),
             url: "https://a/1".into(),
             updated_at: updated_at.into(),
@@ -810,14 +881,13 @@ mod tests {
                 ci: CiStatus::Success,
                 is_draft: true,
                 checks: vec![],
+                ..pr("", "")
             },
             PullRequest {
-                repo: "o/r".into(),
                 title: "a longer title".into(),
                 url: "https://a/22".into(),
                 updated_at: "2026-07-31T10:37:06Z".into(),
                 ci: CiStatus::Running,
-                is_draft: false,
                 checks: vec![
                     Check {
                         name: "CI / build".into(),
@@ -830,6 +900,7 @@ mod tests {
                         url: "".into(),
                     },
                 ],
+                ..pr("", "")
             },
         ];
         let expected = "\
@@ -839,13 +910,56 @@ CI  REPO                TITLE           URL           LAST UPDATED
     🔴 CI / build  https://a/job/1
     🟡 lint
 ";
-        assert_eq!(format_table(&prs, now()), expected);
+        assert_eq!(format_table(&prs, now(), false), expected);
+
+        let expected = "\
+CI  REPO                AUTHOR  TITLE          URL          LAST UPDATED
+🟢  KDAB/KDDockWidgets  me      short (draft)  https://a/1  43 minutes ago
+";
+        assert_eq!(format_table(&prs[..1], now(), true), expected);
+    }
+
+    #[test]
+    fn parse_prs_merges_watched() {
+        let node = |title: &str, author: &str, updated_at: &str| {
+            format!(
+                r#"{{"repository":{{"nameWithOwner":"o/r"}},"author":{{"login":"{author}"}},"title":"{title}",
+                    "url":"https://a/{title}","updatedAt":"{updated_at}","isDraft":false,"commits":{{"nodes":[]}}}}"#
+            )
+        };
+        let json = format!(
+            r#"{{"data":{{"search":{{"nodes":[{}]}},"watched":{{"nodes":[{}]}}}}}}"#,
+            node("mine", "me", "2026-09-01T00:00:00Z"),
+            node("theirs", "bob", "2026-09-02T00:00:00Z"),
+        );
+        let prs: Vec<_> = parse_prs(&json)
+            .unwrap()
+            .into_iter()
+            .map(|pr| (pr.title, pr.author))
+            .collect();
+        assert_eq!(
+            prs,
+            [
+                ("theirs".into(), "bob".into()),
+                ("mine".into(), "me".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn watched_search_lists_repos_and_cutoff() {
+        let repos = ["o/a".to_string(), "o/b".to_string()];
+        assert_eq!(
+            watched_search(&repos, now()),
+            "watched: search(query: \"is:pr is:open -author:@me created:>=2026-09-03 repo:o/a repo:o/b\", \
+             type: ISSUE, first: 100) { nodes { ...Pr } }"
+        );
     }
 
     #[test]
     fn parse_prs_keeps_only_failed_or_running_checks() {
         let json = r#"{"data":{"search":{"nodes":[{"repository":{"nameWithOwner":"o/r"},
-            "title":"t","url":"https://a/1","updatedAt":"2026-01-01T00:00:00Z","isDraft":false,
+            "author":null,"title":"t","url":"https://a/1","updatedAt":"2026-01-01T00:00:00Z","isDraft":false,
             "commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"FAILURE","contexts":{"nodes":[
                 {"__typename":"CheckRun","name":"ok","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"u1","checkSuite":null},
                 {"__typename":"CheckRun","name":"skipped","status":"COMPLETED","conclusion":"SKIPPED","detailsUrl":"u2","checkSuite":null},
