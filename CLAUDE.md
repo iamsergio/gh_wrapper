@@ -15,6 +15,8 @@ Startup sequence in `src/main.rs`:
 
 `gh_wrapper rebase <pr-url>` runs `gh pr update-branch <url> --rebase`, a server-side rebase onto the latest base branch (no local checkout needed; fails on conflicts).
 
+`gh_wrapper rerun <url>` takes an Actions job URL (`…/actions/runs/<run>/job/<job>`, as printed by `--actions`) and runs `gh run rerun --job <job> -R <host>/<owner>/<repo>` (which also reruns the job's dependencies), or a run URL (`…/actions/runs/<run>`, optionally `/attempts/<n>`) and runs `gh run rerun <run> --failed`. The URL is parsed locally (no API call); anything else, e.g. non-Actions status URLs, is rejected.
+
 `gh_wrapper wait <pr-url>` polls the same `resource(url:)` query (plus title/repo) every 30s until CI succeeds or fails, following force pushes; "no checks" counts as pending for 5 minutes per head commit, then aborts. It then shows a critical desktop notification by calling the freedesktop `org.freedesktop.Notifications.Notify` D-Bus method through `gdbus` (not `notify-send`, so libnotify isn't needed), with Merge (only when green) and Open buttons. A `gdbus monitor` started before the notification catches the `ActionInvoked`/`NotificationClosed` signal for its id; Merge runs the `merge` path, Open runs `xdg-open`. Failed CI exits 1; notification errors are only warnings.
 
 `gh_wrapper pr <branch>` refuses `main`/`master` and anything that isn't a local branch (`refs/heads/<branch>`), then runs `git push --force origin <branch>` and `gh pr create --head <branch> --fill` (non-interactive; title/body from the commits).

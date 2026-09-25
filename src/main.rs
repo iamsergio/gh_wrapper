@@ -417,6 +417,58 @@ fn rebase_pr(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug, PartialEq)]
+struct RerunTarget {
+    /// In `gh -R` form: `host/owner/repo`.
+    repo: String,
+    run_id: String,
+    job_id: Option<String>,
+}
+
+/// Accepts `https://<host>/<owner>/<repo>/actions/runs/<run>` (optionally `/attempts/<n>`) or
+/// `…/runs/<run>/job/<job>`, as printed by `--actions`.
+fn parse_rerun_url(url: &str) -> Result<RerunTarget, String> {
+    let err = || format!("not a GitHub Actions run or job URL: {url}");
+    let url = url.split(['?', '#']).next().unwrap_or_default();
+    let path = url.strip_prefix("https://").ok_or_else(err)?;
+    let segments: Vec<&str> = path.trim_end_matches('/').split('/').collect();
+    let [host, owner, repo, "actions", "runs", run_id, rest @ ..] = segments.as_slice() else {
+        return Err(err());
+    };
+    let job_id = match rest {
+        [] | ["attempts", _] => None,
+        ["job", job_id] => Some(*job_id),
+        _ => return Err(err()),
+    };
+    let is_id = |id: &str| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit());
+    if !is_id(run_id) || !job_id.is_none_or(is_id) {
+        return Err(err());
+    }
+    Ok(RerunTarget {
+        repo: format!("{host}/{owner}/{repo}"),
+        run_id: run_id.to_string(),
+        job_id: job_id.map(str::to_string),
+    })
+}
+
+/// Reruns a single job (plus the jobs it depends on), or a run's failed jobs.
+fn rerun(url: &str) -> Result<(), String> {
+    let target = parse_rerun_url(url)?;
+    // gh refuses a run id together with --job.
+    let args = match &target.job_id {
+        Some(job_id) => ["run", "rerun", "--job", job_id, "-R", &target.repo],
+        None => [
+            "run",
+            "rerun",
+            &target.run_id,
+            "--failed",
+            "-R",
+            &target.repo,
+        ],
+    };
+    run("gh", &args)
+}
+
 /// How often `wait` polls the PR's CI.
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -834,6 +886,7 @@ fn main() -> ExitCode {
         [cmd, url] if cmd == "merge" => merge_pr(url),
         [cmd, url] if cmd == "rebase" => rebase_pr(url),
         [cmd, url] if cmd == "wait" => wait_pr(url),
+        [cmd, url] if cmd == "rerun" => rerun(url),
         [cmd, branch] if cmd == "pr" => create_pr(branch),
         flags
             if flags
@@ -846,7 +899,7 @@ fn main() -> ExitCode {
         _ => {
             eprintln!(
                 "usage: gh_wrapper [--actions] [--draft] [--watched] | merge <pr-url> | rebase <pr-url> \
-                 | wait <pr-url> | pr <branch>"
+                 | wait <pr-url> | rerun <run-or-job-url> | pr <branch>"
             );
             return ExitCode::FAILURE;
         }
@@ -1063,6 +1116,46 @@ mod tests {
     fn parse_pr_info_rejects_non_pr_urls() {
         assert!(parse_pr_info(r#"{"data":{"resource":null}}"#).is_err());
         assert!(parse_pr_info(r#"{"data":{"resource":{}}}"#).is_err());
+    }
+
+    #[test]
+    fn parse_rerun_url_accepts_jobs_and_runs() {
+        let target = |run_id: &str, job_id: Option<&str>| RerunTarget {
+            repo: "github.com/o/r".into(),
+            run_id: run_id.into(),
+            job_id: job_id.map(Into::into),
+        };
+        let parse = |url| parse_rerun_url(url).unwrap();
+        assert_eq!(
+            parse("https://github.com/o/r/actions/runs/1/job/2"),
+            target("1", Some("2"))
+        );
+        assert_eq!(
+            parse("https://github.com/o/r/actions/runs/1/job/2?pr=3#step:4:5"),
+            target("1", Some("2"))
+        );
+        assert_eq!(
+            parse("https://github.com/o/r/actions/runs/1/"),
+            target("1", None)
+        );
+        assert_eq!(
+            parse("https://github.com/o/r/actions/runs/1/attempts/2"),
+            target("1", None)
+        );
+    }
+
+    #[test]
+    fn parse_rerun_url_rejects_other_urls() {
+        for url in [
+            "https://github.com/o/r/pull/1",
+            "https://github.com/o/r/actions/runs/x",
+            "https://github.com/o/r/actions/runs/1/job/",
+            "https://github.com/o/r/actions/runs/1/job/2/extra",
+            "http://github.com/o/r/actions/runs/1",
+            "https://ci.example.com/build/1",
+        ] {
+            assert!(parse_rerun_url(url).is_err(), "{url}");
+        }
     }
 
     #[test]
