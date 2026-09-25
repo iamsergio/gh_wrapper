@@ -1,4 +1,7 @@
-use std::process::{Command, ExitCode, Stdio};
+use std::io::{BufRead, BufReader};
+use std::process::{Child, Command, ExitCode, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeDelta, Utc};
 use chrono_humanize::HumanTime;
@@ -317,6 +320,8 @@ const CONTEXTS: &str = "contexts(first: 100) {
 const PR_INFO_QUERY: &str = "query($url: URI!) {
   resource(url: $url) {
     ... on PullRequest {
+      title
+      repository { nameWithOwner }
       headRefName
       headRefOid
       headRepository { nameWithOwner }
@@ -339,6 +344,8 @@ struct ResourceData {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Resource {
+    title: Option<String>,
+    repository: Option<Repository>,
     head_ref_name: Option<String>,
     head_ref_oid: Option<String>,
     head_repository: Option<Repository>,
@@ -348,6 +355,8 @@ struct Resource {
 #[derive(Debug, PartialEq)]
 struct PrInfo {
     ci: CiStatus,
+    title: String,
+    repo: String,
     head_branch: String,
     head_oid: String,
     /// None if the head repository (e.g. a fork) was deleted.
@@ -361,6 +370,8 @@ fn parse_pr_info(json: &str) -> Result<PrInfo, String> {
     let resource = response.data.resource.ok_or_else(not_a_pr)?;
     Ok(PrInfo {
         ci: resource.commits.ok_or_else(not_a_pr)?.ci_status(),
+        title: resource.title.ok_or_else(not_a_pr)?,
+        repo: resource.repository.ok_or_else(not_a_pr)?.name_with_owner,
         head_branch: resource.head_ref_name.ok_or_else(not_a_pr)?,
         head_oid: resource.head_ref_oid.ok_or_else(not_a_pr)?,
         head_repo: resource.head_repository.map(|r| r.name_with_owner),
@@ -404,6 +415,194 @@ fn rebase_pr(url: &str) -> Result<(), String> {
         return Err("`gh pr update-branch` failed".to_string());
     }
     Ok(())
+}
+
+/// How often `wait` polls the PR's CI.
+const POLL_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long `wait` keeps polling a head commit without checks, since CI takes a moment to
+/// register them after a push.
+const NO_CHECKS_GRACE: Duration = Duration::from_secs(5 * 60);
+
+/// Polls the PR until CI finishes, then shows a desktop notification whose buttons merge or
+/// open the PR. Each poll looks at the current head commit, so force pushes are followed.
+fn wait_pr(url: &str) -> Result<(), String> {
+    let fetch = || -> Result<PrInfo, String> {
+        parse_pr_info(&gh_graphql(PR_INFO_QUERY, &[("url", url)])?)
+    };
+    // Fail fast on a bad URL; later failures are likely network hiccups, so they're retried.
+    let mut pr = fetch()?;
+    let mut head_since = Instant::now();
+    println!("Waiting for CI of {}: {}", pr.repo, pr.title);
+    loop {
+        match pr.ci {
+            CiStatus::Success | CiStatus::Failure => break,
+            CiStatus::None if head_since.elapsed() > NO_CHECKS_GRACE => {
+                return Err("PR has no CI checks".to_string());
+            }
+            CiStatus::Running | CiStatus::None => {}
+        }
+        thread::sleep(POLL_INTERVAL);
+        match fetch() {
+            Ok(new) => {
+                if new.head_oid != pr.head_oid {
+                    head_since = Instant::now();
+                }
+                pr = new;
+            }
+            Err(e) => eprintln!("warning: {e}, retrying"),
+        }
+    }
+
+    let passed = pr.ci == CiStatus::Success;
+    let (summary, icon) = match passed {
+        true => ("CI passed", "emblem-success"),
+        false => ("CI failed", "dialog-error"),
+    };
+    println!("{} {summary}", pr.ci.icon());
+    let actions = [("merge", "Merge"), ("open", "Open")];
+    let actions = if passed { &actions[..] } else { &actions[1..] };
+    let body = format!("{}: {}", pr.repo, pr.title);
+    match notify(summary, &body, icon, actions) {
+        Ok(Some(action)) if action == "merge" => merge_pr(url)?,
+        Ok(Some(action)) if action == "open" => run("xdg-open", &[url])?,
+        Ok(_) => {}
+        // e.g. no desktop session; the result was already printed above.
+        Err(e) => eprintln!("warning: failed to show notification: {e}"),
+    }
+    match passed {
+        true => Ok(()),
+        false => Err("CI failed".to_string()),
+    }
+}
+
+const NOTIFICATIONS: [&str; 4] = [
+    "--dest",
+    "org.freedesktop.Notifications",
+    "--object-path",
+    "/org/freedesktop/Notifications",
+];
+
+/// Shows a desktop notification through the freedesktop D-Bus API, like notify-send but
+/// without needing libnotify installed. Blocks until it's closed, returning the key of the
+/// clicked action, if any.
+fn notify(
+    summary: &str,
+    body: &str,
+    icon: &str,
+    actions: &[(&str, &str)],
+) -> Result<Option<String>, String> {
+    let mut monitor = Command::new("gdbus")
+        .args(["monitor", "--session"])
+        .args(NOTIFICATIONS)
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to run gdbus: {e}"))?;
+    let result = show_notification(&mut monitor, summary, body, icon, actions);
+    let _ = monitor.kill();
+    let _ = monitor.wait();
+    result
+}
+
+fn show_notification(
+    monitor: &mut Child,
+    summary: &str,
+    body: &str,
+    icon: &str,
+    actions: &[(&str, &str)],
+) -> Result<Option<String>, String> {
+    let stdout = monitor.stdout.take().expect("stdout is piped");
+    let mut lines = BufReader::new(stdout).lines();
+    // gdbus prints this once subscribed, so a click can't come before we listen for it.
+    lines.next();
+
+    let actions: Vec<String> = actions
+        .iter()
+        .flat_map(|(key, label)| [gvariant_string(key), gvariant_string(label)])
+        .collect();
+    let output = Command::new("gdbus")
+        .args(["call", "--session"])
+        .args(NOTIFICATIONS)
+        .args(["--method", "org.freedesktop.Notifications.Notify"])
+        .args([
+            gvariant_string("gh_wrapper"),
+            // replaces_id: 0 for a new notification.
+            "0".to_string(),
+            gvariant_string(icon),
+            gvariant_string(summary),
+            gvariant_string(&escape_markup(body)),
+            format!("[{}]", actions.join(", ")),
+            // Critical notifications stay on screen until dismissed.
+            "{'urgency': <byte 2>}".to_string(),
+            // expire_timeout: never. The -1 "server default" would be taken as an option.
+            "0".to_string(),
+        ])
+        .output()
+        .map_err(|e| format!("failed to run gdbus: {e}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let reply = String::from_utf8_lossy(&output.stdout);
+    let id = parse_notification_id(&reply)
+        .ok_or_else(|| format!("unexpected gdbus reply: {}", reply.trim()))?;
+
+    for line in lines {
+        let Ok(line) = line else { break };
+        match parse_notification_signal(&line, id) {
+            Some(NotificationSignal::Action(key)) => return Ok(Some(key)),
+            Some(NotificationSignal::Closed) => return Ok(None),
+            None => {}
+        }
+    }
+    Ok(None)
+}
+
+/// gdbus parses each argument as GVariant text, so strings are quoted to be taken literally.
+fn gvariant_string(s: &str) -> String {
+    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+/// Notification bodies may contain HTML-like markup.
+fn escape_markup(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Parses the Notify reply, e.g. "(uint32 42,)".
+fn parse_notification_id(reply: &str) -> Option<u32> {
+    reply
+        .trim()
+        .strip_prefix("(uint32 ")?
+        .strip_suffix(",)")?
+        .parse()
+        .ok()
+}
+
+#[derive(Debug, PartialEq)]
+enum NotificationSignal {
+    Action(String),
+    Closed,
+}
+
+/// Parses a `gdbus monitor` line about notification `id`, e.g.
+/// "/org/freedesktop/Notifications: org.freedesktop.Notifications.ActionInvoked (uint32 42, 'merge')".
+fn parse_notification_signal(line: &str, id: u32) -> Option<NotificationSignal> {
+    let (_, signal) = line.split_once("org.freedesktop.Notifications.")?;
+    let (name, args) = signal.split_once(' ')?;
+    let args = args.strip_prefix('(')?.strip_suffix(')')?;
+    let (signal_id, rest) = args.strip_prefix("uint32 ")?.split_once(", ")?;
+    if signal_id.parse() != Ok(id) {
+        return None;
+    }
+    match name {
+        "ActionInvoked" => {
+            let key = rest.strip_prefix('\'')?.strip_suffix('\'')?;
+            Some(NotificationSignal::Action(key.to_string()))
+        }
+        "NotificationClosed" => Some(NotificationSignal::Closed),
+        _ => None,
+    }
 }
 
 fn check_pr_branch(branch: &str) -> Result<(), String> {
@@ -634,6 +833,7 @@ fn main() -> ExitCode {
     let result = match args.as_slice() {
         [cmd, url] if cmd == "merge" => merge_pr(url),
         [cmd, url] if cmd == "rebase" => rebase_pr(url),
+        [cmd, url] if cmd == "wait" => wait_pr(url),
         [cmd, branch] if cmd == "pr" => create_pr(branch),
         flags
             if flags
@@ -646,7 +846,7 @@ fn main() -> ExitCode {
         _ => {
             eprintln!(
                 "usage: gh_wrapper [--actions] [--draft] [--watched] | merge <pr-url> | rebase <pr-url> \
-                 | pr <branch>"
+                 | wait <pr-url> | pr <branch>"
             );
             return ExitCode::FAILURE;
         }
@@ -787,25 +987,69 @@ mod tests {
 
     #[test]
     fn parse_pr_info_reads_head_and_ci() {
-        let json = r#"{"data":{"resource":{"headRefName":"feat/x","headRefOid":"abc123",
-            "headRepository":{"nameWithOwner":"o/r"},
+        let json = r#"{"data":{"resource":{"title":"t","repository":{"nameWithOwner":"o/r"},
+            "headRefName":"feat/x","headRefOid":"abc123","headRepository":{"nameWithOwner":"o/r"},
             "commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"SUCCESS"}}}]}}}}"#;
         assert_eq!(
             parse_pr_info(json),
             Ok(PrInfo {
                 ci: CiStatus::Success,
+                title: "t".into(),
+                repo: "o/r".into(),
                 head_branch: "feat/x".into(),
                 head_oid: "abc123".into(),
                 head_repo: Some("o/r".into()),
             })
         );
 
-        let json = r#"{"data":{"resource":{"headRefName":"feat/x","headRefOid":"abc123",
-            "headRepository":null,
+        let json = r#"{"data":{"resource":{"title":"t","repository":{"nameWithOwner":"o/r"},
+            "headRefName":"feat/x","headRefOid":"abc123","headRepository":null,
             "commits":{"nodes":[{"commit":{"statusCheckRollup":null}}]}}}}"#;
         let pr = parse_pr_info(json).unwrap();
         assert_eq!(pr.ci, CiStatus::None);
         assert_eq!(pr.head_repo, None);
+    }
+
+    #[test]
+    fn gvariant_string_escapes_quotes() {
+        assert_eq!(gvariant_string(r"it's a\b"), r"'it\'s a\\b'");
+    }
+
+    #[test]
+    fn escape_markup_escapes_html() {
+        assert_eq!(
+            escape_markup("a < b && c > d"),
+            "a &lt; b &amp;&amp; c &gt; d"
+        );
+    }
+
+    #[test]
+    fn parse_notification_id_reads_reply() {
+        assert_eq!(parse_notification_id("(uint32 253,)\n"), Some(253));
+        assert_eq!(parse_notification_id("()"), None);
+    }
+
+    #[test]
+    fn parse_notification_signal_matches_id() {
+        let prefix = "/org/freedesktop/Notifications: org.freedesktop.Notifications.";
+        let parse = |line: &str| parse_notification_signal(&format!("{prefix}{line}"), 42);
+        assert_eq!(
+            parse("ActionInvoked (uint32 42, 'merge')"),
+            Some(NotificationSignal::Action("merge".into()))
+        );
+        assert_eq!(
+            parse("NotificationClosed (uint32 42, uint32 2)"),
+            Some(NotificationSignal::Closed)
+        );
+        assert_eq!(parse("NotificationClosed (uint32 4242, uint32 1)"), None);
+        assert_eq!(parse("ActivationToken (uint32 42, 'xyz')"), None);
+        assert_eq!(
+            parse_notification_signal(
+                "The name org.freedesktop.Notifications is owned by :1.24",
+                42
+            ),
+            None
+        );
     }
 
     #[test]
