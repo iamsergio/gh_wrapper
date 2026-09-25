@@ -152,7 +152,9 @@ struct CheckSuite {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct WorkflowRun {
+    database_id: u64,
     workflow: Workflow,
 }
 
@@ -172,9 +174,7 @@ impl From<CheckContext> for Check {
                 check_suite,
             } => {
                 let ci = match (status.as_str(), conclusion.as_deref()) {
-                    ("COMPLETED", Some("SUCCESS" | "NEUTRAL" | "SKIPPED" | "STALE")) => {
-                        CiStatus::Success
-                    }
+                    ("COMPLETED", c) if is_passing(c) => CiStatus::Success,
                     // Usually fail-fast cancelling sibling jobs after one failed, so it's noise.
                     ("COMPLETED", Some("CANCELLED")) => CiStatus::None,
                     ("COMPLETED", _) => CiStatus::Failure,
@@ -210,6 +210,13 @@ impl From<CheckContext> for Check {
     }
 }
 
+fn is_passing(conclusion: Option<&str>) -> bool {
+    matches!(
+        conclusion,
+        Some("SUCCESS" | "NEUTRAL" | "SKIPPED" | "STALE")
+    )
+}
+
 impl Commits {
     fn ci_status(&self) -> CiStatus {
         let state = self
@@ -220,15 +227,18 @@ impl Commits {
         CiStatus::from_rollup_state(state)
     }
 
-    fn failed_or_running_checks(self) -> Vec<Check> {
-        let contexts = self
-            .nodes
+    fn into_contexts(self) -> Vec<CheckContext> {
+        self.nodes
             .into_iter()
             .next()
             .and_then(|c| c.commit.status_check_rollup)
             .and_then(|r| r.contexts)
-            .map_or_else(Vec::new, |c| c.nodes);
-        let mut checks: Vec<Check> = contexts
+            .map_or_else(Vec::new, |c| c.nodes)
+    }
+
+    fn failed_or_running_checks(self) -> Vec<Check> {
+        let mut checks: Vec<Check> = self
+            .into_contexts()
             .into_iter()
             .map(Check::from)
             .filter(|c| matches!(c.ci, CiStatus::Failure | CiStatus::Running))
@@ -236,6 +246,29 @@ impl Commits {
         // Stable sort: failures first, otherwise keep GitHub's order.
         checks.sort_by_key(|c| c.ci != CiStatus::Failure);
         checks
+    }
+
+    /// Actions runs with a failed or cancelled job, in GitHub's order.
+    fn failed_run_ids(self) -> Vec<u64> {
+        let mut ids = Vec::new();
+        for context in self.into_contexts() {
+            if let CheckContext::CheckRun {
+                status,
+                conclusion,
+                check_suite:
+                    Some(CheckSuite {
+                        workflow_run: Some(run),
+                    }),
+                ..
+            } = context
+                && status == "COMPLETED"
+                && !is_passing(conclusion.as_deref())
+                && !ids.contains(&run.database_id)
+            {
+                ids.push(run.database_id);
+            }
+        }
+        ids
     }
 }
 
@@ -311,7 +344,7 @@ const CONTEXTS: &str = "contexts(first: 100) {
     __typename
     ... on CheckRun {
       name status conclusion detailsUrl
-      checkSuite { workflowRun { workflow { name } } }
+      checkSuite { workflowRun { databaseId workflow { name } } }
     }
     ... on StatusContext { context state targetUrl }
   }
@@ -326,6 +359,15 @@ const PR_INFO_QUERY: &str = "query($url: URI!) {
       headRefOid
       headRepository { nameWithOwner }
       commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+    }
+  }
+}";
+
+// CONTEXTS is substituted as in QUERY.
+const PR_RUNS_QUERY: &str = "query($url: URI!) {
+  resource(url: $url) {
+    ... on PullRequest {
+      commits(last: 1) { nodes { commit { statusCheckRollup { state CONTEXTS } } } }
     }
   }
 }";
@@ -378,6 +420,18 @@ fn parse_pr_info(json: &str) -> Result<PrInfo, String> {
     })
 }
 
+fn parse_failed_run_ids(json: &str) -> Result<Vec<u64>, String> {
+    let response: ResourceResponse =
+        serde_json::from_str(json).map_err(|e| format!("failed to parse gh output: {e}"))?;
+    let not_a_pr = || "not a pull request URL".to_string();
+    let commits = response
+        .data
+        .resource
+        .and_then(|r| r.commits)
+        .ok_or_else(not_a_pr)?;
+    Ok(commits.failed_run_ids())
+}
+
 fn merge_pr(url: &str) -> Result<(), String> {
     let pr = parse_pr_info(&gh_graphql(PR_INFO_QUERY, &[("url", url)])?)?;
     match pr.ci {
@@ -428,7 +482,7 @@ struct RerunTarget {
 /// Accepts `https://<host>/<owner>/<repo>/actions/runs/<run>` (optionally `/attempts/<n>`) or
 /// `…/runs/<run>/job/<job>`, as printed by `--actions`.
 fn parse_rerun_url(url: &str) -> Result<RerunTarget, String> {
-    let err = || format!("not a GitHub Actions run or job URL: {url}");
+    let err = || format!("not a pull request or GitHub Actions run or job URL: {url}");
     let url = url.split(['?', '#']).next().unwrap_or_default();
     let path = url.strip_prefix("https://").ok_or_else(err)?;
     let segments: Vec<&str> = path.trim_end_matches('/').split('/').collect();
@@ -451,8 +505,56 @@ fn parse_rerun_url(url: &str) -> Result<RerunTarget, String> {
     })
 }
 
-/// Reruns a single job (plus the jobs it depends on), or a run's failed jobs.
+/// Accepts `https://<host>/<owner>/<repo>/pull/<n>`, optionally followed by a tab such as
+/// `/checks`. Returns the repo in `gh -R` form and the PR URL without the tab.
+fn parse_pr_url(url: &str) -> Option<(String, String)> {
+    let url = url.split(['?', '#']).next().unwrap_or_default();
+    let path = url.strip_prefix("https://")?;
+    let segments: Vec<&str> = path.trim_end_matches('/').split('/').collect();
+    let [host, owner, repo, "pull", number, ..] = segments.as_slice() else {
+        return None;
+    };
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let repo = format!("{host}/{owner}/{repo}");
+    let url = format!("https://{repo}/pull/{number}");
+    Some((repo, url))
+}
+
+/// Reruns the failed and cancelled jobs (plus their dependents) of every Actions run on the
+/// PR's head commit. `gh run rerun --failed` covers cancelled jobs too.
+fn rerun_pr(repo: &str, url: &str) -> Result<(), String> {
+    let query = PR_RUNS_QUERY.replace("CONTEXTS", CONTEXTS);
+    let run_ids = parse_failed_run_ids(&gh_graphql(&query, &[("url", url)])?)?;
+    if run_ids.is_empty() {
+        return Err("no failed or cancelled Actions jobs to rerun".to_string());
+    }
+    // Keep going, so that one run that can't be rerun (e.g. still in progress) doesn't block
+    // the others.
+    let mut failures = 0;
+    for id in &run_ids {
+        let id = id.to_string();
+        if let Err(e) = run("gh", &["run", "rerun", &id, "--failed", "-R", repo]) {
+            eprintln!("error: {e}");
+            failures += 1;
+        }
+    }
+    if failures > 0 {
+        return Err(format!(
+            "{failures} of {} runs failed to rerun",
+            run_ids.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Reruns a PR's failed and cancelled jobs, a single job (plus the jobs it depends on), or a
+/// run's failed jobs.
 fn rerun(url: &str) -> Result<(), String> {
+    if let Some((repo, pr_url)) = parse_pr_url(url) {
+        return rerun_pr(&repo, &pr_url);
+    }
     let target = parse_rerun_url(url)?;
     // gh refuses a run id together with --job.
     let args = match &target.job_id {
@@ -899,7 +1001,7 @@ fn main() -> ExitCode {
         _ => {
             eprintln!(
                 "usage: gh_wrapper [--actions] [--draft] [--watched] | merge <pr-url> | rebase <pr-url> \
-                 | wait <pr-url> | rerun <run-or-job-url> | pr <branch>"
+                 | wait <pr-url> | rerun <pr-run-or-job-url> | pr <branch>"
             );
             return ExitCode::FAILURE;
         }
@@ -1145,6 +1247,56 @@ mod tests {
     }
 
     #[test]
+    fn parse_pr_url_accepts_prs_only() {
+        let expected = Some((
+            "github.com/o/r".to_string(),
+            "https://github.com/o/r/pull/1".to_string(),
+        ));
+        assert_eq!(parse_pr_url("https://github.com/o/r/pull/1"), expected);
+        assert_eq!(
+            parse_pr_url("https://github.com/o/r/pull/1/checks"),
+            expected
+        );
+        assert_eq!(parse_pr_url("https://github.com/o/r/pull/1/#top"), expected);
+        for url in [
+            "https://github.com/o/r/pull/x",
+            "https://github.com/o/r/pull/",
+            "https://github.com/o/r/issues/1",
+            "https://github.com/o/r/actions/runs/1",
+            "http://github.com/o/r/pull/1",
+        ] {
+            assert_eq!(parse_pr_url(url), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn parse_failed_run_ids_includes_cancelled_and_dedups() {
+        let job = |run: u64, status: &str, conclusion: &str| {
+            format!(
+                r#"{{"__typename":"CheckRun","name":"j","status":"{status}","conclusion":{conclusion},
+                "detailsUrl":null,"checkSuite":{{"workflowRun":{{"databaseId":{run},"workflow":{{"name":"w"}}}}}}}}"#
+            )
+        };
+        let contexts = [
+            job(1, "COMPLETED", r#""SUCCESS""#),
+            job(2, "COMPLETED", r#""FAILURE""#),
+            job(3, "COMPLETED", r#""CANCELLED""#),
+            job(2, "COMPLETED", r#""TIMED_OUT""#),
+            job(4, "IN_PROGRESS", "null"),
+            job(5, "COMPLETED", r#""SKIPPED""#),
+            r#"{"__typename":"StatusContext","context":"c","state":"FAILURE","targetUrl":null}"#
+                .to_string(),
+        ]
+        .join(",");
+        let json = format!(
+            r#"{{"data":{{"resource":{{"commits":{{"nodes":[{{"commit":{{"statusCheckRollup":
+            {{"state":"FAILURE","contexts":{{"nodes":[{contexts}]}}}}}}}}]}}}}}}}}"#
+        );
+        assert_eq!(parse_failed_run_ids(&json), Ok(vec![2, 3]));
+        assert!(parse_failed_run_ids(r#"{"data":{"resource":{}}}"#).is_err());
+    }
+
+    #[test]
     fn parse_rerun_url_rejects_other_urls() {
         for url in [
             "https://github.com/o/r/pull/1",
@@ -1301,7 +1453,7 @@ CI  REPO                AUTHOR  TITLE          URL          LAST UPDATED
                 {"__typename":"CheckRun","name":"ok","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"u1","checkSuite":null},
                 {"__typename":"CheckRun","name":"skipped","status":"COMPLETED","conclusion":"SKIPPED","detailsUrl":"u2","checkSuite":null},
                 {"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"TIMED_OUT","detailsUrl":"u3",
-                    "checkSuite":{"workflowRun":{"workflow":{"name":"CI"}}}},
+                    "checkSuite":{"workflowRun":{"databaseId":1,"workflow":{"name":"CI"}}}},
                 {"__typename":"CheckRun","name":"cancelled","status":"COMPLETED","conclusion":"CANCELLED","detailsUrl":"u6","checkSuite":null},
                 {"__typename":"CheckRun","name":"test","status":"QUEUED","conclusion":null,"detailsUrl":null,"checkSuite":null},
                 {"__typename":"StatusContext","context":"ext/ci","state":"ERROR","targetUrl":"u5"},
