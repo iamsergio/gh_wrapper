@@ -362,6 +362,42 @@ fn rebase_pr(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn check_pr_branch(branch: &str) -> Result<(), String> {
+    match branch {
+        "main" | "master" => Err(format!("refusing to force push {branch}")),
+        _ => Ok(()),
+    }
+}
+
+/// Force pushes a local branch to origin and opens a PR for it, filled from its commits.
+fn create_pr(branch: &str) -> Result<(), String> {
+    check_pr_branch(branch)?;
+    // Otherwise `git push` would also accept tags, remote branches or commits.
+    let is_local_branch = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{branch}"))
+        .stdout(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !is_local_branch {
+        return Err(format!("{branch} is not a local branch"));
+    }
+
+    run("git", &["push", "--force", "origin", branch])?;
+    run("gh", &["pr", "create", "--head", branch, "--fill"])
+}
+
+fn run(program: &str, args: &[&str]) -> Result<(), String> {
+    let status = Command::new(program)
+        .args(args)
+        .status()
+        .map_err(|e| format!("failed to run {program}: {e}"))?;
+    if !status.success() {
+        return Err(format!("`{program} {}` failed", args.join(" ")));
+    }
+    Ok(())
+}
+
 /// Best effort: the PR is already merged, so failures are only warnings.
 fn delete_remote_branch(repo: &str, branch: &str) {
     let output = Command::new("gh")
@@ -543,12 +579,15 @@ fn main() -> ExitCode {
     let result = match args.as_slice() {
         [cmd, url] if cmd == "merge" => merge_pr(url),
         [cmd, url] if cmd == "rebase" => rebase_pr(url),
+        [cmd, branch] if cmd == "pr" => create_pr(branch),
         flags if flags.iter().all(|f| f == "--actions" || f == "--draft") => list(
             flags.iter().any(|f| f == "--actions"),
             flags.iter().any(|f| f == "--draft"),
         ),
         _ => {
-            eprintln!("usage: gh_wrapper [--actions] [--draft] | merge <pr-url> | rebase <pr-url>");
+            eprintln!(
+                "usage: gh_wrapper [--actions] [--draft] | merge <pr-url> | rebase <pr-url> | pr <branch>"
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -696,6 +735,13 @@ mod tests {
         let pr = parse_pr_info(json).unwrap();
         assert_eq!(pr.ci, CiStatus::None);
         assert_eq!(pr.head_repo, None);
+    }
+
+    #[test]
+    fn check_pr_branch_rejects_main_and_master() {
+        assert!(check_pr_branch("main").is_err());
+        assert!(check_pr_branch("master").is_err());
+        assert!(check_pr_branch("feature").is_ok());
     }
 
     #[test]
