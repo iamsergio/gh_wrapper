@@ -15,6 +15,8 @@ Startup sequence in `src/main.rs`:
 
 `gh_wrapper rebase <pr-url>` runs `gh pr update-branch <url> --rebase`, a server-side rebase onto the latest base branch (no local checkout needed; fails on conflicts).
 
+`gh_wrapper pr <branch>` refuses `main`/`master` and anything that isn't a local branch (`refs/heads/<branch>`), then runs `git push --force origin <branch>` and `gh pr create --head <branch> --fill` (non-interactive; title/body from the commits).
+
 ## Commands
 
 CI (`.github/workflows/build.yml`, Linux/macOS/Windows) runs these; keep them passing:
