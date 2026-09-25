@@ -446,9 +446,9 @@ fn relative_time(timestamp: &str, now: DateTime<Utc>) -> String {
     }
 }
 
-fn is_hidden(pr: &PullRequest, now: DateTime<Utc>) -> bool {
+fn is_hidden(pr: &PullRequest, now: DateTime<Utc>, show_drafts: bool) -> bool {
     if pr.is_draft {
-        return true;
+        return !show_drafts;
     }
     // Release PRs are opened by bots and tend to linger; hide them once they're stale.
     let Ok(updated) = DateTime::parse_from_rfc3339(&pr.updated_at) else {
@@ -458,8 +458,10 @@ fn is_hidden(pr: &PullRequest, now: DateTime<Utc>) -> bool {
         && now - updated.with_timezone(&Utc) > TimeDelta::days(30)
 }
 
-fn filter_prs(prs: Vec<PullRequest>, now: DateTime<Utc>) -> Vec<PullRequest> {
-    prs.into_iter().filter(|pr| !is_hidden(pr, now)).collect()
+fn filter_prs(prs: Vec<PullRequest>, now: DateTime<Utc>, show_drafts: bool) -> Vec<PullRequest> {
+    prs.into_iter()
+        .filter(|pr| !is_hidden(pr, now, show_drafts))
+        .collect()
 }
 
 fn format_table(prs: &[PullRequest], now: DateTime<Utc>) -> String {
@@ -468,13 +470,21 @@ fn format_table(prs: &[PullRequest], now: DateTime<Utc>) -> String {
         .iter()
         .map(|pr| relative_time(&pr.updated_at, now))
         .collect();
+    let titles: Vec<String> = prs
+        .iter()
+        .map(|pr| match pr.is_draft {
+            true => format!("{} (draft)", pr.title),
+            false => pr.title.clone(),
+        })
+        .collect();
     let rows: Vec<[&str; 4]> = prs
         .iter()
         .zip(&updated)
-        .map(|(pr, updated)| {
+        .zip(&titles)
+        .map(|((pr, updated), title)| {
             [
                 pr.repo.as_str(),
-                pr.title.as_str(),
+                title.as_str(),
                 pr.url.as_str(),
                 updated.as_str(),
             ]
@@ -531,12 +541,14 @@ fn main() -> ExitCode {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.as_slice() {
-        [] => list(false),
-        [flag] if flag == "--actions" => list(true),
         [cmd, url] if cmd == "merge" => merge_pr(url),
         [cmd, url] if cmd == "rebase" => rebase_pr(url),
+        flags if flags.iter().all(|f| f == "--actions" || f == "--draft") => list(
+            flags.iter().any(|f| f == "--actions"),
+            flags.iter().any(|f| f == "--draft"),
+        ),
         _ => {
-            eprintln!("usage: gh_wrapper [--actions | merge <pr-url> | rebase <pr-url>]");
+            eprintln!("usage: gh_wrapper [--actions] [--draft] | merge <pr-url> | rebase <pr-url>");
             return ExitCode::FAILURE;
         }
     };
@@ -550,10 +562,10 @@ fn main() -> ExitCode {
     }
 }
 
-fn list(with_checks: bool) -> Result<(), String> {
+fn list(with_checks: bool, show_drafts: bool) -> Result<(), String> {
     let prs = parse_prs(&list_open_prs(with_checks)?)?;
     let now = Utc::now();
-    let prs = filter_prs(prs, now);
+    let prs = filter_prs(prs, now, show_drafts);
     print!("{}", format_table(&prs, now));
     Ok(())
 }
@@ -656,7 +668,7 @@ mod tests {
             pr("chore: release v2", "2026-09-20T00:00:00Z"),
             pr("feat: old but not a release", "2025-01-01T00:00:00Z"),
         ];
-        let titles: Vec<_> = filter_prs(prs, now())
+        let titles: Vec<_> = filter_prs(prs, now(), false)
             .into_iter()
             .map(|pr| pr.title)
             .collect();
@@ -701,11 +713,27 @@ mod tests {
             },
             pr("ready", "2026-09-24T20:00:00Z"),
         ];
-        let titles: Vec<_> = filter_prs(prs, now())
+        let titles: Vec<_> = filter_prs(prs, now(), false)
             .into_iter()
             .map(|pr| pr.title)
             .collect();
         assert_eq!(titles, ["ready"]);
+    }
+
+    #[test]
+    fn filter_prs_shows_drafts_when_asked() {
+        let prs = vec![
+            PullRequest {
+                is_draft: true,
+                ..pr("draft", "2026-09-24T20:00:00Z")
+            },
+            pr("ready", "2026-09-24T20:00:00Z"),
+        ];
+        let titles: Vec<_> = filter_prs(prs, now(), true)
+            .into_iter()
+            .map(|pr| pr.title)
+            .collect();
+        assert_eq!(titles, ["draft", "ready"]);
     }
 
     #[test]
@@ -734,7 +762,7 @@ mod tests {
                 url: "https://a/1".into(),
                 updated_at: "2026-09-24T20:16:53Z".into(),
                 ci: CiStatus::Success,
-                is_draft: false,
+                is_draft: true,
                 checks: vec![],
             },
             PullRequest {
@@ -760,7 +788,7 @@ mod tests {
         ];
         let expected = "\
 CI  REPO                TITLE           URL           LAST UPDATED
-🟢  KDAB/KDDockWidgets  short           https://a/1   43 minutes ago
+🟢  KDAB/KDDockWidgets  short (draft)   https://a/1   43 minutes ago
 🟡  o/r                 a longer title  https://a/22  2 months ago
     🔴 CI / build  https://a/job/1
     🟡 lint
