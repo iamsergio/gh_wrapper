@@ -432,18 +432,40 @@ fn parse_failed_run_ids(json: &str) -> Result<Vec<u64>, String> {
     Ok(commits.failed_run_ids())
 }
 
-fn merge_pr(url: &str) -> Result<(), String> {
-    let pr = parse_pr_info(&gh_graphql(PR_INFO_QUERY, &[("url", url)])?)?;
-    match pr.ci {
-        CiStatus::Success => {}
-        CiStatus::Failure => return Err("CI failed, not merging".to_string()),
-        CiStatus::Running => return Err("CI is still running, not merging".to_string()),
-        CiStatus::None => return Err("PR has no CI checks, not merging".to_string()),
-    }
+fn fetch_pr_info(url: &str) -> Result<PrInfo, String> {
+    parse_pr_info(&gh_graphql(PR_INFO_QUERY, &[("url", url)])?)
+}
 
+/// Waits for CI to pass, then merges; bails out if it fails. If it had to wait, the outcome is
+/// also shown as a desktop notification. With `force`, merges right away without looking at CI.
+fn merge_pr(url: &str, force: bool) -> Result<(), String> {
+    if force {
+        return merge_head(url, &fetch_pr_info(url)?);
+    }
+    let (pr, waited) = wait_for_ci(url)?;
+    let result = match pr.ci {
+        CiStatus::Success => merge_head(url, &pr),
+        CiStatus::None => Err("PR has no CI checks, not merging".to_string()),
+        CiStatus::Failure | CiStatus::Running => Err("CI failed, not merging".to_string()),
+    };
+    if waited {
+        let (summary, icon) = match &result {
+            Ok(()) => ("Merged".to_string(), "emblem-success"),
+            Err(e) => (format!("Not merged: {e}"), "dialog-error"),
+        };
+        // The merge result matters more than a failure to open the PR.
+        if let Err(e) = notify_pr(url, &pr, &summary, icon, false) {
+            eprintln!("warning: {e}");
+        }
+    }
+    result
+}
+
+/// Merges the PR at the head commit `pr` was fetched at.
+fn merge_head(url: &str, pr: &PrInfo) -> Result<(), String> {
     // Passing a merge method makes gh non-interactive. --delete-branch isn't used because it
     // also deletes the local branch; the remote one is deleted below instead.
-    // --match-head-commit refuses the merge if someone pushed after the CI check above.
+    // --match-head-commit refuses the merge if someone pushed after CI was checked.
     let status = Command::new("gh")
         .args(["pr", "merge", url, "--rebase", "--match-head-commit"])
         .arg(&pr.head_oid)
@@ -578,26 +600,23 @@ const POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// register them after a push.
 const NO_CHECKS_GRACE: Duration = Duration::from_secs(5 * 60);
 
-/// Polls the PR until CI finishes, then shows a desktop notification whose buttons merge or
-/// open the PR. Each poll looks at the current head commit, so force pushes are followed.
-fn wait_pr(url: &str) -> Result<(), String> {
-    let fetch = || -> Result<PrInfo, String> {
-        parse_pr_info(&gh_graphql(PR_INFO_QUERY, &[("url", url)])?)
-    };
+/// Polls the PR until CI succeeds or fails, or has had no checks for `NO_CHECKS_GRACE`
+/// (returned as `CiStatus::None`). Each poll looks at the current head commit, so force pushes
+/// are followed. Also returns whether CI was still unfinished at the first poll.
+fn wait_for_ci(url: &str) -> Result<(PrInfo, bool), String> {
     // Fail fast on a bad URL; later failures are likely network hiccups, so they're retried.
-    let mut pr = fetch()?;
+    let mut pr = fetch_pr_info(url)?;
+    let waited = !matches!(pr.ci, CiStatus::Success | CiStatus::Failure);
     let mut head_since = Instant::now();
     println!("Waiting for CI of {}: {}", pr.repo, pr.title);
     loop {
         match pr.ci {
             CiStatus::Success | CiStatus::Failure => break,
-            CiStatus::None if head_since.elapsed() > NO_CHECKS_GRACE => {
-                return Err("PR has no CI checks".to_string());
-            }
+            CiStatus::None if head_since.elapsed() > NO_CHECKS_GRACE => break,
             CiStatus::Running | CiStatus::None => {}
         }
         thread::sleep(POLL_INTERVAL);
-        match fetch() {
+        match fetch_pr_info(url) {
             Ok(new) => {
                 if new.head_oid != pr.head_oid {
                     head_since = Instant::now();
@@ -607,27 +626,54 @@ fn wait_pr(url: &str) -> Result<(), String> {
             Err(e) => eprintln!("warning: {e}, retrying"),
         }
     }
-
-    let passed = pr.ci == CiStatus::Success;
-    let (summary, icon) = match passed {
-        true => ("CI passed", "emblem-success"),
-        false => ("CI failed", "dialog-error"),
-    };
-    println!("{} {summary}", pr.ci.icon());
-    let actions = [("merge", "Merge"), ("open", "Open")];
-    let actions = if passed { &actions[..] } else { &actions[1..] };
-    let body = format!("{}: {}", pr.repo, pr.title);
-    match notify(summary, &body, icon, actions) {
-        Ok(Some(action)) if action == "merge" => merge_pr(url)?,
-        Ok(Some(action)) if action == "open" => run("xdg-open", &[url])?,
-        Ok(_) => {}
-        // e.g. no desktop session; the result was already printed above.
-        Err(e) => eprintln!("warning: failed to show notification: {e}"),
+    match pr.ci {
+        CiStatus::Success => println!("{} CI passed", pr.ci.icon()),
+        CiStatus::Failure => println!("{} CI failed", pr.ci.icon()),
+        CiStatus::Running | CiStatus::None => {}
     }
+    Ok((pr, waited))
+}
+
+/// Waits for CI, then shows a desktop notification whose buttons merge or open the PR.
+fn wait_pr(url: &str) -> Result<(), String> {
+    let (pr, _) = wait_for_ci(url)?;
+    let (summary, icon) = match pr.ci {
+        CiStatus::Success => ("CI passed", "emblem-success"),
+        CiStatus::Failure | CiStatus::Running => ("CI failed", "dialog-error"),
+        CiStatus::None => return Err("PR has no CI checks".to_string()),
+    };
+    let passed = pr.ci == CiStatus::Success;
+    notify_pr(url, &pr, summary, icon, passed)?;
     match passed {
         true => Ok(()),
         false => Err("CI failed".to_string()),
     }
+}
+
+/// Shows a desktop notification about the PR with an Open button, plus Merge if `can_merge`,
+/// and blocks until it's closed. Failing to show it is only a warning.
+fn notify_pr(
+    url: &str,
+    pr: &PrInfo,
+    summary: &str,
+    icon: &str,
+    can_merge: bool,
+) -> Result<(), String> {
+    let actions = [("merge", "Merge"), ("open", "Open")];
+    let actions = if can_merge {
+        &actions[..]
+    } else {
+        &actions[1..]
+    };
+    let body = format!("{}: {}", pr.repo, pr.title);
+    match notify(summary, &body, icon, actions) {
+        Ok(Some(action)) if action == "merge" => merge_head(url, pr)?,
+        Ok(Some(action)) if action == "open" => run("xdg-open", &[url])?,
+        Ok(_) => {}
+        // e.g. no desktop session; the result is also printed to the terminal.
+        Err(e) => eprintln!("warning: failed to show notification: {e}"),
+    }
+    Ok(())
 }
 
 const NOTIFICATIONS: [&str; 4] = [
@@ -985,7 +1031,10 @@ fn main() -> ExitCode {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.as_slice() {
-        [cmd, url] if cmd == "merge" => merge_pr(url),
+        [cmd, url] if cmd == "merge" => merge_pr(url, false),
+        [cmd, a, b] if cmd == "merge" && (a == "--force" || b == "--force") => {
+            merge_pr(if a == "--force" { b } else { a }, true)
+        }
         [cmd, url] if cmd == "rebase" => rebase_pr(url),
         [cmd, url] if cmd == "wait" => wait_pr(url),
         [cmd, url] if cmd == "rerun" => rerun(url),
@@ -1000,7 +1049,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: gh_wrapper [--actions] [--draft] [--watched] | merge <pr-url> | rebase <pr-url> \
+                "usage: gh_wrapper [--actions] [--draft] [--watched] | merge [--force] <pr-url> | rebase <pr-url> \
                  | wait <pr-url> | rerun <pr-run-or-job-url> | pr <branch>"
             );
             return ExitCode::FAILURE;
