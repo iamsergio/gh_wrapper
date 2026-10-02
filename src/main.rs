@@ -668,7 +668,14 @@ fn notify_pr(
     let body = format!("{}: {}", pr.repo, pr.title);
     match notify(summary, &body, icon, actions) {
         Ok(Some(action)) if action == "merge" => merge_head(url, pr)?,
-        Ok(Some(action)) if action == "open" => run("xdg-open", &[url])?,
+        Ok(Some(action)) if action == "open" => run(
+            if cfg!(target_os = "macos") {
+                "open"
+            } else {
+                "xdg-open"
+            },
+            &[url],
+        )?,
         Ok(_) => {}
         // e.g. no desktop session; the result is also printed to the terminal.
         Err(e) => eprintln!("warning: failed to show notification: {e}"),
@@ -692,6 +699,9 @@ fn notify(
     icon: &str,
     actions: &[(&str, &str)],
 ) -> Result<Option<String>, String> {
+    if cfg!(target_os = "macos") {
+        return notify_macos(summary, body, actions);
+    }
     let mut monitor = Command::new("gdbus")
         .args(["monitor", "--session"])
         .args(NOTIFICATIONS)
@@ -702,6 +712,41 @@ fn notify(
     let _ = monitor.kill();
     let _ = monitor.wait();
     result
+}
+
+const DISMISS_LABEL: &str = "Dismiss";
+
+/// macOS has no D-Bus, so this shows an `osascript` alert instead (it supports at most three
+/// buttons: the actions plus Dismiss). Blocks until a button is clicked, returning the key of
+/// the clicked action, if any. The text is passed as arguments so it needs no escaping.
+fn notify_macos(
+    summary: &str,
+    body: &str,
+    actions: &[(&str, &str)],
+) -> Result<Option<String>, String> {
+    let script = "on run argv\n\
+        set btns to rest of rest of argv\n\
+        set r to display alert (item 1 of argv) message (item 2 of argv) buttons btns as critical\n\
+        return button returned of r\n\
+        end run";
+    let labels = actions
+        .iter()
+        .map(|(_, label)| *label)
+        .chain([DISMISS_LABEL]);
+    let output = Command::new("osascript")
+        .args(["-e", script, "--", summary, body])
+        .args(labels)
+        .output()
+        .map_err(|e| format!("failed to run osascript: {e}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let clicked = String::from_utf8_lossy(&output.stdout);
+    let clicked = clicked.trim();
+    Ok(actions
+        .iter()
+        .find(|(_, label)| *label == clicked)
+        .map(|(key, _)| key.to_string()))
 }
 
 fn show_notification(
