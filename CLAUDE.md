@@ -21,6 +21,8 @@ Startup sequence in `src/main.rs`:
 
 `gh_wrapper pr <branch>` refuses `main`/`master` and anything that isn't a local branch (`refs/heads/<branch>`), then runs `git push --force origin <branch>` and `gh pr create --head <branch> --fill` (non-interactive; title/body from the commits).
 
+Every subcommand taking a URL (`merge`, `rebase`, `wait`, `rerun`) first runs it through `normalize_url`, which prepends `https:` to a scheme-less `//host/…` URL (macOS double-click doesn't select the `https:` part).
+
 ## Commands
 
 CI (`.github/workflows/build.yml`, Linux/macOS/Windows) runs these; keep them passing:

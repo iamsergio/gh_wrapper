@@ -1076,13 +1076,13 @@ fn main() -> ExitCode {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.as_slice() {
-        [cmd, url] if cmd == "merge" => merge_pr(url, false),
+        [cmd, url] if cmd == "merge" => merge_pr(&normalize_url(url), false),
         [cmd, a, b] if cmd == "merge" && (a == "--force" || b == "--force") => {
-            merge_pr(if a == "--force" { b } else { a }, true)
+            merge_pr(&normalize_url(if a == "--force" { b } else { a }), true)
         }
-        [cmd, url] if cmd == "rebase" => rebase_pr(url),
-        [cmd, url] if cmd == "wait" => wait_pr(url),
-        [cmd, url] if cmd == "rerun" => rerun(url),
+        [cmd, url] if cmd == "rebase" => rebase_pr(&normalize_url(url)),
+        [cmd, url] if cmd == "wait" => wait_pr(&normalize_url(url)),
+        [cmd, url] if cmd == "rerun" => rerun(&normalize_url(url)),
         [cmd, branch] if cmd == "pr" => create_pr(branch),
         flags
             if flags
@@ -1107,6 +1107,16 @@ fn main() -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Prepends `https:` to a scheme-less `//host/...` URL: on macOS, double-clicking a URL doesn't
+/// select its `https:` part, so pasted URLs often lack it.
+fn normalize_url(url: &str) -> String {
+    if url.starts_with("//") {
+        format!("https:{url}")
+    } else {
+        url.to_string()
     }
 }
 
@@ -1338,6 +1348,19 @@ mod tests {
             parse("https://github.com/o/r/actions/runs/1/attempts/2"),
             target("1", None)
         );
+    }
+
+    #[test]
+    fn normalize_url_prepends_https_to_scheme_relative_urls() {
+        assert_eq!(
+            normalize_url("//github.com/o/r/pull/1"),
+            "https://github.com/o/r/pull/1"
+        );
+        assert_eq!(
+            normalize_url("https://github.com/o/r/pull/1"),
+            "https://github.com/o/r/pull/1"
+        );
+        assert_eq!(normalize_url("github.com/o/r"), "github.com/o/r");
     }
 
     #[test]
