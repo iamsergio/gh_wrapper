@@ -608,7 +608,9 @@ fn wait_for_ci(url: &str) -> Result<(PrInfo, bool), String> {
     let mut pr = fetch_pr_info(url)?;
     let waited = !matches!(pr.ci, CiStatus::Success | CiStatus::Failure);
     let mut head_since = Instant::now();
-    println!("Waiting for CI of {}: {}", pr.repo, pr.title);
+    if waited {
+        println!("Waiting for CI of {}: {}", pr.repo, pr.title);
+    }
     loop {
         match pr.ci {
             CiStatus::Success | CiStatus::Failure => break,
