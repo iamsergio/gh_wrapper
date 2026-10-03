@@ -217,6 +217,16 @@ fn is_passing(conclusion: Option<&str>) -> bool {
     )
 }
 
+impl PrInfo {
+    /// Errors if the PR is no longer open, since there's no CI to wait for or merge.
+    fn ensure_open(&self) -> Result<(), String> {
+        match self.state.as_str() {
+            "OPEN" => Ok(()),
+            state => Err(format!("PR is already {}", state.to_lowercase())),
+        }
+    }
+}
+
 impl Commits {
     fn ci_status(&self) -> CiStatus {
         let state = self
@@ -354,6 +364,7 @@ const PR_INFO_QUERY: &str = "query($url: URI!) {
   resource(url: $url) {
     ... on PullRequest {
       title
+      state
       repository { nameWithOwner }
       headRefName
       headRefOid
@@ -387,6 +398,7 @@ struct ResourceData {
 #[serde(rename_all = "camelCase")]
 struct Resource {
     title: Option<String>,
+    state: Option<String>,
     repository: Option<Repository>,
     head_ref_name: Option<String>,
     head_ref_oid: Option<String>,
@@ -397,6 +409,8 @@ struct Resource {
 #[derive(Debug, PartialEq)]
 struct PrInfo {
     ci: CiStatus,
+    /// OPEN, CLOSED or MERGED.
+    state: String,
     title: String,
     repo: String,
     head_branch: String,
@@ -413,6 +427,7 @@ fn parse_pr_info(json: &str) -> Result<PrInfo, String> {
     Ok(PrInfo {
         ci: resource.commits.ok_or_else(not_a_pr)?.ci_status(),
         title: resource.title.ok_or_else(not_a_pr)?,
+        state: resource.state.ok_or_else(not_a_pr)?,
         repo: resource.repository.ok_or_else(not_a_pr)?.name_with_owner,
         head_branch: resource.head_ref_name.ok_or_else(not_a_pr)?,
         head_oid: resource.head_ref_oid.ok_or_else(not_a_pr)?,
@@ -440,7 +455,9 @@ fn fetch_pr_info(url: &str) -> Result<PrInfo, String> {
 /// also shown as a desktop notification. With `force`, merges right away without looking at CI.
 fn merge_pr(url: &str, force: bool) -> Result<(), String> {
     if force {
-        return merge_head(url, &fetch_pr_info(url)?);
+        let pr = fetch_pr_info(url)?;
+        pr.ensure_open()?;
+        return merge_head(url, &pr);
     }
     let (pr, waited) = wait_for_ci(url)?;
     let result = match pr.ci {
@@ -606,6 +623,7 @@ const NO_CHECKS_GRACE: Duration = Duration::from_secs(5 * 60);
 fn wait_for_ci(url: &str) -> Result<(PrInfo, bool), String> {
     // Fail fast on a bad URL; later failures are likely network hiccups, so they're retried.
     let mut pr = fetch_pr_info(url)?;
+    pr.ensure_open()?;
     let waited = !matches!(pr.ci, CiStatus::Success | CiStatus::Failure);
     let mut head_since = Instant::now();
     if waited {
@@ -624,6 +642,8 @@ fn wait_for_ci(url: &str) -> Result<(PrInfo, bool), String> {
                     head_since = Instant::now();
                 }
                 pr = new;
+                // Merged or closed while waiting.
+                pr.ensure_open()?;
             }
             Err(e) => eprintln!("warning: {e}, retrying"),
         }
@@ -1255,13 +1275,14 @@ mod tests {
 
     #[test]
     fn parse_pr_info_reads_head_and_ci() {
-        let json = r#"{"data":{"resource":{"title":"t","repository":{"nameWithOwner":"o/r"},
+        let json = r#"{"data":{"resource":{"title":"t","state":"OPEN","repository":{"nameWithOwner":"o/r"},
             "headRefName":"feat/x","headRefOid":"abc123","headRepository":{"nameWithOwner":"o/r"},
             "commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"SUCCESS"}}}]}}}}"#;
         assert_eq!(
             parse_pr_info(json),
             Ok(PrInfo {
                 ci: CiStatus::Success,
+                state: "OPEN".into(),
                 title: "t".into(),
                 repo: "o/r".into(),
                 head_branch: "feat/x".into(),
@@ -1270,7 +1291,7 @@ mod tests {
             })
         );
 
-        let json = r#"{"data":{"resource":{"title":"t","repository":{"nameWithOwner":"o/r"},
+        let json = r#"{"data":{"resource":{"title":"t","state":"OPEN","repository":{"nameWithOwner":"o/r"},
             "headRefName":"feat/x","headRefOid":"abc123","headRepository":null,
             "commits":{"nodes":[{"commit":{"statusCheckRollup":null}}]}}}}"#;
         let pr = parse_pr_info(json).unwrap();
