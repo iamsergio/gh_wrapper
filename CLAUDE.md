@@ -21,6 +21,8 @@ Startup sequence in `src/main.rs`:
 
 `gh_wrapper pr <branch>` refuses `main`/`master` and anything that isn't a local branch (`refs/heads/<branch>`), then runs `git push --force origin <branch>` and `gh pr create --head <branch> --fill` (non-interactive; title/body from the commits).
 
+Setting `GHW_DEBUG` (any value) logs every subprocess to stderr as `[GHW_DEBUG] $ <command line>` before it runs (long arguments like GraphQL queries truncated) and `took <n>s` after, to find slow or hanging steps. All subprocesses go through the `Traced` trait's `traced_status`/`traced_output`/`traced_spawn` instead of `Command::status`/`output`/`spawn`, so new ones should too.
+
 Every subcommand taking a URL (`merge`, `rebase`, `wait`, `rerun`) first runs it through `normalize_url`, which prepends `https:` to a scheme-less `//host/…` URL (macOS double-click doesn't select the `https:` part).
 
 ## Commands

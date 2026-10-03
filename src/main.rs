@@ -1,5 +1,5 @@
-use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, ExitCode, Stdio};
+use std::io::{self, BufRead, BufReader};
+use std::process::{Child, Command, ExitCode, ExitStatus, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -336,7 +336,7 @@ fn watched_repos() -> Result<Vec<String>, String> {
         .args(["api", "user/subscriptions?per_page=100", "--paginate"])
         .args(["--jq", ".[].full_name"])
         .stderr(Stdio::inherit())
-        .output()
+        .traced_output()
         .map_err(|e| format!("failed to run gh: {e}"))?;
     if !output.status.success() {
         return Err("`gh api user/subscriptions` failed".to_string());
@@ -486,7 +486,7 @@ fn merge_head(url: &str, pr: &PrInfo) -> Result<(), String> {
     let status = Command::new("gh")
         .args(["pr", "merge", url, "--rebase", "--match-head-commit"])
         .arg(&pr.head_oid)
-        .status()
+        .traced_status()
         .map_err(|e| format!("failed to run gh: {e}"))?;
     if !status.success() {
         return Err("`gh pr merge` failed".to_string());
@@ -502,7 +502,7 @@ fn merge_head(url: &str, pr: &PrInfo) -> Result<(), String> {
 fn rebase_pr(url: &str) -> Result<(), String> {
     let status = Command::new("gh")
         .args(["pr", "update-branch", url, "--rebase"])
-        .status()
+        .traced_status()
         .map_err(|e| format!("failed to run gh: {e}"))?;
     if !status.success() {
         return Err("`gh pr update-branch` failed".to_string());
@@ -731,7 +731,7 @@ fn notify(
         .args(["monitor", "--session"])
         .args(NOTIFICATIONS)
         .stdout(Stdio::piped())
-        .spawn()
+        .traced_spawn()
         .map_err(|e| format!("failed to run gdbus: {e}"))?;
     let result = show_notification(&mut monitor, summary, body, icon, actions);
     let _ = monitor.kill();
@@ -761,7 +761,7 @@ fn notify_macos(
     let output = Command::new("osascript")
         .args(["-e", script, "--", summary, body])
         .args(labels)
-        .output()
+        .traced_output()
         .map_err(|e| format!("failed to run osascript: {e}"))?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
@@ -807,7 +807,7 @@ fn show_notification(
             // expire_timeout: never. The -1 "server default" would be taken as an option.
             "0".to_string(),
         ])
-        .output()
+        .traced_output()
         .map_err(|e| format!("failed to run gdbus: {e}"))?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
@@ -890,7 +890,7 @@ fn create_pr(branch: &str) -> Result<(), String> {
         .args(["rev-parse", "--verify", "--quiet"])
         .arg(format!("refs/heads/{branch}"))
         .stdout(Stdio::null())
-        .status()
+        .traced_status()
         .is_ok_and(|s| s.success());
     if !is_local_branch {
         return Err(format!("{branch} is not a local branch"));
@@ -900,10 +900,79 @@ fn create_pr(branch: &str) -> Result<(), String> {
     run("gh", &["pr", "create", "--head", branch, "--fill"])
 }
 
+/// Env var that, when set, makes every subprocess be logged to stderr with its duration.
+const DEBUG_ENV: &str = "GHW_DEBUG";
+
+/// `status`/`output`/`spawn` that log the command line and how long it took if `DEBUG_ENV` is
+/// set. The line is printed before running, so a hanging command is visible.
+trait Traced {
+    fn traced_status(&mut self) -> io::Result<ExitStatus>;
+    fn traced_output(&mut self) -> io::Result<Output>;
+    fn traced_spawn(&mut self) -> io::Result<Child>;
+}
+
+impl Traced for Command {
+    fn traced_status(&mut self) -> io::Result<ExitStatus> {
+        trace(self, Command::status)
+    }
+
+    fn traced_output(&mut self) -> io::Result<Output> {
+        trace(self, Command::output)
+    }
+
+    fn traced_spawn(&mut self) -> io::Result<Child> {
+        trace(self, Command::spawn)
+    }
+}
+
+fn debug_enabled() -> bool {
+    std::env::var_os(DEBUG_ENV).is_some()
+}
+
+fn debug(message: &str) {
+    if debug_enabled() {
+        eprintln!("[{DEBUG_ENV}] {message}");
+    }
+}
+
+fn trace<T>(cmd: &mut Command, f: impl FnOnce(&mut Command) -> io::Result<T>) -> io::Result<T> {
+    if !debug_enabled() {
+        return f(cmd);
+    }
+    debug(&format!("$ {}", command_line(cmd)));
+    let start = Instant::now();
+    let result = f(cmd);
+    let elapsed = start.elapsed().as_secs_f64();
+    match &result {
+        Ok(_) => debug(&format!("  took {elapsed:.2}s")),
+        Err(e) => debug(&format!("  failed after {elapsed:.2}s: {e}")),
+    }
+    result
+}
+
+/// The command line on one line; long arguments such as GraphQL queries are truncated.
+fn command_line(cmd: &Command) -> String {
+    const MAX_ARG: usize = 60;
+    let mut line = cmd.get_program().to_string_lossy().into_owned();
+    for arg in cmd.get_args() {
+        let arg = arg
+            .to_string_lossy()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        line.push(' ');
+        match arg.char_indices().nth(MAX_ARG) {
+            Some((i, _)) => line.push_str(&format!("{}…", &arg[..i])),
+            None => line.push_str(&arg),
+        }
+    }
+    line
+}
+
 fn run(program: &str, args: &[&str]) -> Result<(), String> {
     let status = Command::new(program)
         .args(args)
-        .status()
+        .traced_status()
         .map_err(|e| format!("failed to run {program}: {e}"))?;
     if !status.success() {
         return Err(format!("`{program} {}` failed", args.join(" ")));
@@ -916,7 +985,7 @@ fn delete_remote_branch(repo: &str, branch: &str) {
     let output = Command::new("gh")
         .args(["api", "-X", "DELETE"])
         .arg(format!("repos/{repo}/git/refs/heads/{branch}"))
-        .output();
+        .traced_output();
     match output {
         Ok(o) if o.status.success() => println!("Deleted remote branch {repo}:{branch}"),
         // The repo's "automatically delete head branches" setting may have beaten us to it.
@@ -937,7 +1006,7 @@ fn gh_installed() -> bool {
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .traced_status()
         .is_ok_and(|s| s.success())
 }
 
@@ -946,7 +1015,7 @@ fn gh_authenticated() -> bool {
         .args(["auth", "status"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .traced_status()
         .is_ok_and(|s| s.success())
 }
 
@@ -959,7 +1028,7 @@ fn gh_graphql(query: &str, vars: &[(&str, &str)]) -> Result<String, String> {
     }
     let output = cmd
         .stderr(Stdio::inherit())
-        .output()
+        .traced_output()
         .map_err(|e| format!("failed to run gh: {e}"))?;
     if !output.status.success() {
         return Err("`gh api graphql` failed".to_string());
