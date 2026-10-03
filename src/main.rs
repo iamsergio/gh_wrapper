@@ -637,7 +637,8 @@ fn wait_for_ci(url: &str) -> Result<(PrInfo, bool), String> {
 }
 
 /// Waits for CI, then shows a desktop notification whose buttons merge or open the PR.
-fn wait_pr(url: &str) -> Result<(), String> {
+/// With `notify` false, only the exit status and the terminal output report the result.
+fn wait_pr(url: &str, notify: bool) -> Result<(), String> {
     let (pr, _) = wait_for_ci(url)?;
     let (summary, icon) = match pr.ci {
         CiStatus::Success => ("CI passed", "emblem-success"),
@@ -645,7 +646,9 @@ fn wait_pr(url: &str) -> Result<(), String> {
         CiStatus::None => return Err("PR has no CI checks".to_string()),
     };
     let passed = pr.ci == CiStatus::Success;
-    notify_pr(url, &pr, summary, icon, passed)?;
+    if notify {
+        notify_pr(url, &pr, summary, icon, passed)?;
+    }
     match passed {
         true => Ok(()),
         false => Err("CI failed".to_string()),
@@ -1083,7 +1086,11 @@ fn main() -> ExitCode {
             merge_pr(&normalize_url(if a == "--force" { b } else { a }), true)
         }
         [cmd, url] if cmd == "rebase" => rebase_pr(&normalize_url(url)),
-        [cmd, url] if cmd == "wait" => wait_pr(&normalize_url(url)),
+        [cmd, url] if cmd == "wait" => wait_pr(&normalize_url(url), true),
+        [cmd, a, b] if cmd == "wait" && (a == "--no-notify" || b == "--no-notify") => wait_pr(
+            &normalize_url(if a == "--no-notify" { b } else { a }),
+            false,
+        ),
         [cmd, url] if cmd == "rerun" => rerun(&normalize_url(url)),
         [cmd, branch] if cmd == "pr" => create_pr(branch),
         flags
@@ -1097,7 +1104,7 @@ fn main() -> ExitCode {
         _ => {
             eprintln!(
                 "usage: gh_wrapper [--actions] [--draft] [--watched] | merge [--force] <pr-url> | rebase <pr-url> \
-                 | wait <pr-url> | rerun <pr-run-or-job-url> | pr <branch>"
+                 | wait [--no-notify] <pr-url> | rerun <pr-run-or-job-url> | pr <branch>"
             );
             return ExitCode::FAILURE;
         }
