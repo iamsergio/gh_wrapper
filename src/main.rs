@@ -1246,11 +1246,21 @@ fn format_table(prs: &[PullRequest], now: DateTime<Utc>, show_author: bool) -> S
     let no_checks: &[Check] = &[];
     let details = std::iter::once((no_checks, None))
         .chain(prs.iter().map(|pr| (&pr.checks[..], pr.bar.render())));
-    for ((icon, row), (checks, bar)) in icons.zip(std::iter::once(headers).chain(rows)).zip(details)
+    let url_column = headers.iter().position(|&h| h == "URL");
+    for (line, ((icon, row), (checks, bar))) in icons
+        .zip(std::iter::once(headers).chain(rows))
+        .zip(details)
+        .enumerate()
     {
         out.push_str(icon);
-        for (cell, &w) in row.iter().zip(&widths) {
-            out.push_str(&format!("  {cell:<w$}"));
+        for (column, (cell, &w)) in row.iter().zip(&widths).enumerate() {
+            // Blue PR URLs (not the header); the padding stays outside the color.
+            if line > 0 && Some(column) == url_column {
+                let pad = " ".repeat(w - cell.chars().count());
+                out.push_str(&format!("  \x1b[34m{cell}\x1b[0m{pad}"));
+            } else {
+                out.push_str(&format!("  {cell:<w$}"));
+            }
         }
         // Last column is padded too; don't leave trailing spaces.
         out.truncate(out.trim_end().len());
@@ -1749,8 +1759,8 @@ mod tests {
         ];
         let expected = "\
 CI  REPO                TITLE           URL           LAST UPDATED
-🟢  KDAB/KDDockWidgets  short (draft)   https://a/1   43 minutes ago
-🟡  o/r                 a longer title  https://a/22  2 months ago
+🟢  KDAB/KDDockWidgets  short (draft)   \x1b[34mhttps://a/1\x1b[0m   43 minutes ago
+🟡  o/r                 a longer title  \x1b[34mhttps://a/22\x1b[0m  2 months ago
     🔴 CI / build  https://a/job/1
     🟡 lint
 ";
@@ -1758,7 +1768,7 @@ CI  REPO                TITLE           URL           LAST UPDATED
 
         let expected = "\
 CI  REPO                AUTHOR  TITLE          URL          LAST UPDATED
-🟢  KDAB/KDDockWidgets  me      short (draft)  https://a/1  43 minutes ago
+🟢  KDAB/KDDockWidgets  me      short (draft)  \x1b[34mhttps://a/1\x1b[0m  43 minutes ago
 ";
         assert_eq!(format_table(&prs[..1], now(), true), expected);
     }
