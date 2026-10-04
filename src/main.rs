@@ -48,6 +48,8 @@ struct PullRequest {
     is_draft: bool,
     /// Failed or running checks; only fetched with `--actions`.
     checks: Vec<Check>,
+    /// Counts of all checks; all zero unless fetched with `--actions`.
+    progress: CheckProgress,
 }
 
 /// An Actions run with failed or cancelled jobs.
@@ -299,16 +301,18 @@ impl Commits {
             .map_or_else(Vec::new, |c| c.nodes)
     }
 
-    fn failed_or_running_checks(self) -> Vec<Check> {
-        let mut checks: Vec<Check> = self
-            .into_contexts()
+    /// The progress of all checks, and the failed or running ones.
+    fn progress_and_checks(self) -> (CheckProgress, Vec<Check>) {
+        let contexts = self.into_contexts();
+        let progress = CheckProgress::from_contexts(&contexts);
+        let mut checks: Vec<Check> = contexts
             .into_iter()
             .map(Check::from)
             .filter(|c| matches!(c.ci, CiStatus::Failure | CiStatus::Running))
             .collect();
         // Stable sort: failures first, otherwise keep GitHub's order.
         checks.sort_by_key(|c| c.ci != CiStatus::Failure);
-        checks
+        (progress, checks)
     }
 
     /// Actions runs with a failed or cancelled job, in GitHub's order.
@@ -353,15 +357,18 @@ impl Commits {
 
 impl From<PrNode> for PullRequest {
     fn from(node: PrNode) -> Self {
+        let ci = node.commits.ci_status();
+        let (progress, checks) = node.commits.progress_and_checks();
         Self {
-            ci: node.commits.ci_status(),
+            ci,
+            progress,
             repo: node.repository.name_with_owner,
             author: node.author.map_or_else(|| "ghost".to_string(), |a| a.login),
             title: node.title,
             url: node.url,
             updated_at: node.updated_at,
             is_draft: node.is_draft,
-            checks: node.commits.failed_or_running_checks(),
+            checks,
         }
     }
 }
@@ -1217,9 +1224,13 @@ fn format_table(prs: &[PullRequest], now: DateTime<Utc>, show_author: bool) -> S
     let icons = std::iter::once("CI").chain(prs.iter().map(|pr| pr.ci.icon()));
 
     let mut out = String::new();
-    for ((icon, row), checks) in icons
-        .zip(std::iter::once(headers).chain(rows))
-        .zip(std::iter::once(&[][..]).chain(prs.iter().map(|pr| &pr.checks[..])))
+    let no_checks: &[Check] = &[];
+    let details = std::iter::once((no_checks, None)).chain(prs.iter().map(|pr| {
+        let total = pr.progress.completed + pr.progress.in_progress + pr.progress.remaining;
+        (&pr.checks[..], (total > 0).then_some(pr.progress))
+    }));
+    for ((icon, row), (checks, progress)) in
+        icons.zip(std::iter::once(headers).chain(rows)).zip(details)
     {
         out.push_str(icon);
         for (cell, &w) in row.iter().zip(&widths) {
@@ -1230,6 +1241,9 @@ fn format_table(prs: &[PullRequest], now: DateTime<Utc>, show_author: bool) -> S
         out.push('\n');
 
         // Indented under the REPO column.
+        if let Some(progress) = progress {
+            out.push_str(&format!("    {progress}\n"));
+        }
         let name_width = checks.iter().map(|c| c.name.chars().count()).max();
         for check in checks {
             let w = name_width.unwrap_or(0);
@@ -1409,6 +1423,7 @@ mod tests {
             ci: CiStatus::None,
             is_draft: false,
             checks: vec![],
+            progress: CheckProgress::default(),
         }
     }
 
@@ -1701,6 +1716,7 @@ mod tests {
                 ci: CiStatus::Success,
                 is_draft: true,
                 checks: vec![],
+                progress: CheckProgress::default(),
                 ..pr("", "")
             },
             PullRequest {
