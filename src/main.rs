@@ -48,8 +48,69 @@ struct PullRequest {
     is_draft: bool,
     /// Failed or running checks; only fetched with `--actions`.
     checks: Vec<Check>,
-    /// Counts of all checks; all zero unless fetched with `--actions`.
-    progress: CheckProgress,
+    /// Tally of all checks; empty unless fetched with `--actions`.
+    bar: CheckBar,
+}
+
+/// How many checks passed, failed or are still running (cancelled ones are left out, see
+/// `Check::from`); drawn as a filled bar under the PR's row with `--actions`.
+#[derive(Debug, Default, PartialEq, Clone, Copy)]
+struct CheckBar {
+    passed: usize,
+    failed: usize,
+    running: usize,
+}
+
+impl CheckBar {
+    const WIDTH: usize = 30;
+
+    fn tally(checks: &[Check]) -> Self {
+        let mut bar = Self::default();
+        for check in checks {
+            match check.ci {
+                CiStatus::Success => bar.passed += 1,
+                CiStatus::Failure => bar.failed += 1,
+                CiStatus::Running => bar.running += 1,
+                CiStatus::None => {}
+            }
+        }
+        bar
+    }
+
+    /// Cells for passed, failed and running: proportional, but every non-empty part gets at
+    /// least one, and together they fill `WIDTH`.
+    fn cells(&self) -> [usize; 3] {
+        let counts = [self.passed, self.failed, self.running];
+        let total: usize = counts.iter().sum();
+        if total == 0 {
+            return [0; 3];
+        }
+        let mut cells = counts.map(|c| match c {
+            0 => 0,
+            c => (c * Self::WIDTH / total).max(1),
+        });
+        // Rounding may over- or undershoot; the largest part absorbs the difference.
+        let largest = (0..3).max_by_key(|&i| cells[i]).unwrap_or(0);
+        let others: usize = cells.iter().sum::<usize>() - cells[largest];
+        cells[largest] = Self::WIDTH.saturating_sub(others);
+        cells
+    }
+
+    /// Green, red and yellow blocks, or None if there are no checks.
+    fn render(&self) -> Option<String> {
+        const COLORS: [&str; 3] = ["32", "31", "33"];
+        let cells = self.cells();
+        if cells == [0; 3] {
+            return None;
+        }
+        let mut out = String::new();
+        for (n, color) in cells.into_iter().zip(COLORS) {
+            if n > 0 {
+                out.push_str(&format!("\x1b[{color}m{}\x1b[0m", "█".repeat(n)));
+            }
+        }
+        Some(out)
+    }
 }
 
 /// An Actions run with failed or cancelled jobs.
@@ -241,48 +302,7 @@ impl PrInfo {
     }
 }
 
-/// How many checks of the head commit are done, running, or not started yet.
-#[derive(Debug, Default, PartialEq, Clone, Copy)]
-struct CheckProgress {
-    completed: usize,
-    in_progress: usize,
-    remaining: usize,
-}
-
-impl CheckProgress {
-    fn from_contexts(contexts: &[CheckContext]) -> Self {
-        let mut progress = Self::default();
-        for context in contexts {
-            let state = match context {
-                CheckContext::CheckRun { status, .. } => status.as_str(),
-                CheckContext::StatusContext { state, .. } => state.as_str(),
-            };
-            match state {
-                "COMPLETED" | "SUCCESS" | "FAILURE" | "ERROR" => progress.completed += 1,
-                "IN_PROGRESS" => progress.in_progress += 1,
-                // QUEUED, WAITING, REQUESTED, PENDING, EXPECTED
-                _ => progress.remaining += 1,
-            }
-        }
-        progress
-    }
-}
-
-impl std::fmt::Display for CheckProgress {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} completed, {} in progress, {} remaining",
-            self.completed, self.in_progress, self.remaining
-        )
-    }
-}
-
 impl Commits {
-    fn progress(self) -> CheckProgress {
-        CheckProgress::from_contexts(&self.into_contexts())
-    }
-
     fn ci_status(&self) -> CiStatus {
         let state = self
             .nodes
@@ -301,18 +321,17 @@ impl Commits {
             .map_or_else(Vec::new, |c| c.nodes)
     }
 
-    /// The progress of all checks, and the failed or running ones.
-    fn progress_and_checks(self) -> (CheckProgress, Vec<Check>) {
-        let contexts = self.into_contexts();
-        let progress = CheckProgress::from_contexts(&contexts);
-        let mut checks: Vec<Check> = contexts
+    /// The tally of all checks, and the failed or running ones.
+    fn tally_and_checks(self) -> (CheckBar, Vec<Check>) {
+        let all: Vec<Check> = self.into_contexts().into_iter().map(Check::from).collect();
+        let bar = CheckBar::tally(&all);
+        let mut checks: Vec<Check> = all
             .into_iter()
-            .map(Check::from)
             .filter(|c| matches!(c.ci, CiStatus::Failure | CiStatus::Running))
             .collect();
         // Stable sort: failures first, otherwise keep GitHub's order.
         checks.sort_by_key(|c| c.ci != CiStatus::Failure);
-        (progress, checks)
+        (bar, checks)
     }
 
     /// Actions runs with a failed or cancelled job, in GitHub's order.
@@ -358,10 +377,9 @@ impl Commits {
 impl From<PrNode> for PullRequest {
     fn from(node: PrNode) -> Self {
         let ci = node.commits.ci_status();
-        let (progress, checks) = node.commits.progress_and_checks();
+        let (bar, checks) = node.commits.tally_and_checks();
         Self {
             ci,
-            progress,
             repo: node.repository.name_with_owner,
             author: node.author.map_or_else(|| "ghost".to_string(), |a| a.login),
             title: node.title,
@@ -369,6 +387,7 @@ impl From<PrNode> for PullRequest {
             updated_at: node.updated_at,
             is_draft: node.is_draft,
             checks,
+            bar,
         }
     }
 }
@@ -445,7 +464,7 @@ const PR_INFO_QUERY: &str = "query($url: URI!) {
       headRefName
       headRefOid
       headRepository { nameWithOwner }
-      commits(last: 1) { nodes { commit { statusCheckRollup { state CONTEXTS } } } }
+      commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
     }
   }
 }";
@@ -485,7 +504,6 @@ struct Resource {
 #[derive(Debug, PartialEq)]
 struct PrInfo {
     ci: CiStatus,
-    progress: CheckProgress,
     /// OPEN, CLOSED or MERGED.
     state: String,
     title: String,
@@ -501,10 +519,8 @@ fn parse_pr_info(json: &str) -> Result<PrInfo, String> {
         serde_json::from_str(json).map_err(|e| format!("failed to parse gh output: {e}"))?;
     let not_a_pr = || "not a pull request URL".to_string();
     let resource = response.data.resource.ok_or_else(not_a_pr)?;
-    let commits = resource.commits.ok_or_else(not_a_pr)?;
     Ok(PrInfo {
-        ci: commits.ci_status(),
-        progress: commits.progress(),
+        ci: resource.commits.ok_or_else(not_a_pr)?.ci_status(),
         title: resource.title.ok_or_else(not_a_pr)?,
         state: resource.state.ok_or_else(not_a_pr)?,
         repo: resource.repository.ok_or_else(not_a_pr)?.name_with_owner,
@@ -532,8 +548,7 @@ fn fetch_failed_runs(url: &str) -> Result<Vec<FailedRun>, String> {
 }
 
 fn fetch_pr_info(url: &str) -> Result<PrInfo, String> {
-    let query = PR_INFO_QUERY.replace("CONTEXTS", CONTEXTS);
-    parse_pr_info(&gh_graphql(&query, &[("url", url)])?)
+    parse_pr_info(&gh_graphql(PR_INFO_QUERY, &[("url", url)])?)
 }
 
 /// Waits for CI to pass, then merges; bails out if it fails. If it had to wait, the outcome is
@@ -739,7 +754,6 @@ fn wait_for_ci(url: &str) -> Result<(PrInfo, bool), String> {
     let mut head_since = Instant::now();
     if waited {
         println!("Waiting for CI of {}: {}", pr.repo, pr.title);
-        println!("{} {}", pr.ci.icon(), pr.progress);
     }
     loop {
         match pr.ci {
@@ -753,13 +767,9 @@ fn wait_for_ci(url: &str) -> Result<(PrInfo, bool), String> {
                 if new.head_oid != pr.head_oid {
                     head_since = Instant::now();
                 }
-                let changed = new.progress != pr.progress;
                 pr = new;
                 // Merged or closed while waiting.
                 pr.ensure_open()?;
-                if changed {
-                    println!("{} {}", pr.ci.icon(), pr.progress);
-                }
             }
             Err(e) => eprintln!("warning: {e}, retrying"),
         }
@@ -1225,12 +1235,9 @@ fn format_table(prs: &[PullRequest], now: DateTime<Utc>, show_author: bool) -> S
 
     let mut out = String::new();
     let no_checks: &[Check] = &[];
-    let details = std::iter::once((no_checks, None)).chain(prs.iter().map(|pr| {
-        let total = pr.progress.completed + pr.progress.in_progress + pr.progress.remaining;
-        (&pr.checks[..], (total > 0).then_some(pr.progress))
-    }));
-    for ((icon, row), (checks, progress)) in
-        icons.zip(std::iter::once(headers).chain(rows)).zip(details)
+    let details = std::iter::once((no_checks, None))
+        .chain(prs.iter().map(|pr| (&pr.checks[..], pr.bar.render())));
+    for ((icon, row), (checks, bar)) in icons.zip(std::iter::once(headers).chain(rows)).zip(details)
     {
         out.push_str(icon);
         for (cell, &w) in row.iter().zip(&widths) {
@@ -1241,8 +1248,8 @@ fn format_table(prs: &[PullRequest], now: DateTime<Utc>, show_author: bool) -> S
         out.push('\n');
 
         // Indented under the REPO column.
-        if let Some(progress) = progress {
-            out.push_str(&format!("    {progress}\n"));
+        if let Some(bar) = bar {
+            out.push_str(&format!("    {bar}\n"));
         }
         let name_width = checks.iter().map(|c| c.name.chars().count()).max();
         for check in checks {
@@ -1423,7 +1430,7 @@ mod tests {
             ci: CiStatus::None,
             is_draft: false,
             checks: vec![],
-            progress: CheckProgress::default(),
+            bar: CheckBar::default(),
         }
     }
 
@@ -1450,7 +1457,6 @@ mod tests {
             parse_pr_info(json),
             Ok(PrInfo {
                 ci: CiStatus::Success,
-                progress: CheckProgress::default(),
                 state: "OPEN".into(),
                 title: "t".into(),
                 repo: "o/r".into(),
@@ -1469,28 +1475,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_pr_info_counts_check_progress() {
-        let json = r#"{"data":{"resource":{"title":"t","state":"OPEN","repository":{"nameWithOwner":"o/r"},
-            "headRefName":"b","headRefOid":"abc","headRepository":null,
-            "commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"PENDING","contexts":{"nodes":[
-                {"__typename":"CheckRun","databaseId":1,"name":"a","status":"COMPLETED","conclusion":"SUCCESS"},
-                {"__typename":"CheckRun","databaseId":2,"name":"b","status":"IN_PROGRESS","conclusion":null},
-                {"__typename":"CheckRun","databaseId":3,"name":"c","status":"QUEUED","conclusion":null},
-                {"__typename":"StatusContext","context":"d","state":"PENDING"},
-                {"__typename":"StatusContext","context":"e","state":"FAILURE"}]}}}}]}}}}"#;
-        let progress = parse_pr_info(json).unwrap().progress;
-        assert_eq!(
-            progress,
-            CheckProgress {
-                completed: 2,
-                in_progress: 1,
-                remaining: 2
-            }
-        );
-        assert_eq!(
-            progress.to_string(),
-            "2 completed, 1 in progress, 2 remaining"
-        );
+    fn check_bar_cells_fill_the_width() {
+        let bar = |passed, failed, running| CheckBar {
+            passed,
+            failed,
+            running,
+        };
+        assert_eq!(bar(0, 0, 0).cells(), [0; 3]);
+        assert_eq!(bar(5, 0, 0).cells(), [30, 0, 0]);
+        assert_eq!(bar(1, 1, 1).cells(), [10; 3]);
+        // Small parts stay visible.
+        let [passed, failed, running] = bar(100, 1, 1).cells();
+        assert!(failed >= 1 && running >= 1);
+        assert_eq!(passed + failed + running, 30);
+        assert!(bar(0, 0, 0).render().is_none());
     }
 
     #[test]
@@ -1716,7 +1714,7 @@ mod tests {
                 ci: CiStatus::Success,
                 is_draft: true,
                 checks: vec![],
-                progress: CheckProgress::default(),
+                bar: CheckBar::default(),
                 ..pr("", "")
             },
             PullRequest {
