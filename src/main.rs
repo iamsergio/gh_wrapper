@@ -934,31 +934,6 @@ fn parse_notification_signal(line: &str, id: u32) -> Option<NotificationSignal> 
     }
 }
 
-fn check_pr_branch(branch: &str) -> Result<(), String> {
-    match branch {
-        "main" | "master" => Err(format!("refusing to force push {branch}")),
-        _ => Ok(()),
-    }
-}
-
-/// Force pushes a local branch to origin and opens a PR for it, filled from its commits.
-fn create_pr(branch: &str) -> Result<(), String> {
-    check_pr_branch(branch)?;
-    // Otherwise `git push` would also accept tags, remote branches or commits.
-    let is_local_branch = Command::new("git")
-        .args(["rev-parse", "--verify", "--quiet"])
-        .arg(format!("refs/heads/{branch}"))
-        .stdout(Stdio::null())
-        .traced_status()
-        .is_ok_and(|s| s.success());
-    if !is_local_branch {
-        return Err(format!("{branch} is not a local branch"));
-    }
-
-    run("git", &["push", "--force", "origin", branch])?;
-    run("gh", &["pr", "create", "--head", branch, "--fill"])
-}
-
 /// Env var that, when set, makes every subprocess be logged to stderr with its duration.
 const DEBUG_ENV: &str = "GHW_DEBUG";
 
@@ -1241,7 +1216,6 @@ fn main() -> ExitCode {
         ),
         [cmd, url] if cmd == "rerun" => rerun(&normalize_url(url)),
         [cmd, url] if cmd == "run_failed" => run_failed(&normalize_url(url)),
-        [cmd, branch] if cmd == "pr" => create_pr(branch),
         flags
             if flags
                 .iter()
@@ -1253,8 +1227,7 @@ fn main() -> ExitCode {
         _ => {
             eprintln!(
                 "usage: gh_wrapper [--actions] [--draft] [--watched] | merge [--force] <pr-url> | rebase <pr-url> \
-                 | wait [--no-notify] <pr-url> | rerun <pr-run-or-job-url> | run_failed <pr-url> \
-                 | pr <branch>"
+                 | wait [--no-notify] <pr-url> | rerun <pr-run-or-job-url> | run_failed <pr-url>"
             );
             return ExitCode::FAILURE;
         }
@@ -1469,13 +1442,6 @@ mod tests {
             ),
             None
         );
-    }
-
-    #[test]
-    fn check_pr_branch_rejects_main_and_master() {
-        assert!(check_pr_branch("main").is_err());
-        assert!(check_pr_branch("master").is_err());
-        assert!(check_pr_branch("feature").is_ok());
     }
 
     #[test]
