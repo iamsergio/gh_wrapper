@@ -239,7 +239,48 @@ impl PrInfo {
     }
 }
 
+/// How many checks of the head commit are done, running, or not started yet.
+#[derive(Debug, Default, PartialEq, Clone, Copy)]
+struct CheckProgress {
+    completed: usize,
+    in_progress: usize,
+    remaining: usize,
+}
+
+impl CheckProgress {
+    fn from_contexts(contexts: &[CheckContext]) -> Self {
+        let mut progress = Self::default();
+        for context in contexts {
+            let state = match context {
+                CheckContext::CheckRun { status, .. } => status.as_str(),
+                CheckContext::StatusContext { state, .. } => state.as_str(),
+            };
+            match state {
+                "COMPLETED" | "SUCCESS" | "FAILURE" | "ERROR" => progress.completed += 1,
+                "IN_PROGRESS" => progress.in_progress += 1,
+                // QUEUED, WAITING, REQUESTED, PENDING, EXPECTED
+                _ => progress.remaining += 1,
+            }
+        }
+        progress
+    }
+}
+
+impl std::fmt::Display for CheckProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} completed, {} in progress, {} remaining",
+            self.completed, self.in_progress, self.remaining
+        )
+    }
+}
+
 impl Commits {
+    fn progress(self) -> CheckProgress {
+        CheckProgress::from_contexts(&self.into_contexts())
+    }
+
     fn ci_status(&self) -> CiStatus {
         let state = self
             .nodes
@@ -397,7 +438,7 @@ const PR_INFO_QUERY: &str = "query($url: URI!) {
       headRefName
       headRefOid
       headRepository { nameWithOwner }
-      commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+      commits(last: 1) { nodes { commit { statusCheckRollup { state CONTEXTS } } } }
     }
   }
 }";
@@ -437,6 +478,7 @@ struct Resource {
 #[derive(Debug, PartialEq)]
 struct PrInfo {
     ci: CiStatus,
+    progress: CheckProgress,
     /// OPEN, CLOSED or MERGED.
     state: String,
     title: String,
@@ -452,8 +494,10 @@ fn parse_pr_info(json: &str) -> Result<PrInfo, String> {
         serde_json::from_str(json).map_err(|e| format!("failed to parse gh output: {e}"))?;
     let not_a_pr = || "not a pull request URL".to_string();
     let resource = response.data.resource.ok_or_else(not_a_pr)?;
+    let commits = resource.commits.ok_or_else(not_a_pr)?;
     Ok(PrInfo {
-        ci: resource.commits.ok_or_else(not_a_pr)?.ci_status(),
+        ci: commits.ci_status(),
+        progress: commits.progress(),
         title: resource.title.ok_or_else(not_a_pr)?,
         state: resource.state.ok_or_else(not_a_pr)?,
         repo: resource.repository.ok_or_else(not_a_pr)?.name_with_owner,
@@ -481,7 +525,8 @@ fn fetch_failed_runs(url: &str) -> Result<Vec<FailedRun>, String> {
 }
 
 fn fetch_pr_info(url: &str) -> Result<PrInfo, String> {
-    parse_pr_info(&gh_graphql(PR_INFO_QUERY, &[("url", url)])?)
+    let query = PR_INFO_QUERY.replace("CONTEXTS", CONTEXTS);
+    parse_pr_info(&gh_graphql(&query, &[("url", url)])?)
 }
 
 /// Waits for CI to pass, then merges; bails out if it fails. If it had to wait, the outcome is
@@ -687,6 +732,7 @@ fn wait_for_ci(url: &str) -> Result<(PrInfo, bool), String> {
     let mut head_since = Instant::now();
     if waited {
         println!("Waiting for CI of {}: {}", pr.repo, pr.title);
+        println!("{} {}", pr.ci.icon(), pr.progress);
     }
     loop {
         match pr.ci {
@@ -700,9 +746,13 @@ fn wait_for_ci(url: &str) -> Result<(PrInfo, bool), String> {
                 if new.head_oid != pr.head_oid {
                     head_since = Instant::now();
                 }
+                let changed = new.progress != pr.progress;
                 pr = new;
                 // Merged or closed while waiting.
                 pr.ensure_open()?;
+                if changed {
+                    println!("{} {}", pr.ci.icon(), pr.progress);
+                }
             }
             Err(e) => eprintln!("warning: {e}, retrying"),
         }
@@ -1385,6 +1435,7 @@ mod tests {
             parse_pr_info(json),
             Ok(PrInfo {
                 ci: CiStatus::Success,
+                progress: CheckProgress::default(),
                 state: "OPEN".into(),
                 title: "t".into(),
                 repo: "o/r".into(),
@@ -1400,6 +1451,31 @@ mod tests {
         let pr = parse_pr_info(json).unwrap();
         assert_eq!(pr.ci, CiStatus::None);
         assert_eq!(pr.head_repo, None);
+    }
+
+    #[test]
+    fn parse_pr_info_counts_check_progress() {
+        let json = r#"{"data":{"resource":{"title":"t","state":"OPEN","repository":{"nameWithOwner":"o/r"},
+            "headRefName":"b","headRefOid":"abc","headRepository":null,
+            "commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"PENDING","contexts":{"nodes":[
+                {"__typename":"CheckRun","databaseId":1,"name":"a","status":"COMPLETED","conclusion":"SUCCESS"},
+                {"__typename":"CheckRun","databaseId":2,"name":"b","status":"IN_PROGRESS","conclusion":null},
+                {"__typename":"CheckRun","databaseId":3,"name":"c","status":"QUEUED","conclusion":null},
+                {"__typename":"StatusContext","context":"d","state":"PENDING"},
+                {"__typename":"StatusContext","context":"e","state":"FAILURE"}]}}}}]}}}}"#;
+        let progress = parse_pr_info(json).unwrap().progress;
+        assert_eq!(
+            progress,
+            CheckProgress {
+                completed: 2,
+                in_progress: 1,
+                remaining: 2
+            }
+        );
+        assert_eq!(
+            progress.to_string(),
+            "2 completed, 1 in progress, 2 remaining"
+        );
     }
 
     #[test]
