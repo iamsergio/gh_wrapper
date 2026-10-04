@@ -25,6 +25,8 @@ Startup sequence in `src/main.rs`:
 
 Setting `GHW_DEBUG` (any value) logs every subprocess to stderr as `[GHW_DEBUG] $ <command line>` before it runs (long arguments like GraphQL queries truncated) and `took <n>s` after, to find slow or hanging steps. All subprocesses go through the `Traced` trait's `traced_status`/`traced_output`/`traced_spawn` instead of `Command::status`/`output`/`spawn`, so new ones should too.
 
+`merge` and `wait` without a URL print the plain listing (as with no arguments) and use the URL of the only open PR, failing if there are none or several.
+
 Every subcommand taking a URL (`merge`, `rebase`, `wait`, `rerun`, `run_failed`) first runs it through `normalize_url`, which prepends `https:` to a scheme-less `//host/…` URL (macOS double-click doesn't select the `https:` part).
 
 ## Commands
