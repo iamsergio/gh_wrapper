@@ -1292,7 +1292,18 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(args.first().map(String::as_str), Some("merge" | "wait"))
+        && args[1..].iter().all(|a| a.starts_with("--"))
+    {
+        match sole_pr_url() {
+            Ok(url) => args.push(url),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     let result = match args.as_slice() {
         [cmd, url] if cmd == "merge" => merge_pr(&normalize_url(url), false),
         [cmd, a, b] if cmd == "merge" && (a == "--force" || b == "--force") => {
@@ -1312,12 +1323,12 @@ fn main() -> ExitCode {
                 .all(|f| ["--actions", "--draft", "--watched"].contains(&f.as_str())) =>
         {
             let has = |flag| flags.iter().any(|f| f == flag);
-            list(has("--actions"), has("--draft"), has("--watched"))
+            list(has("--actions"), has("--draft"), has("--watched")).map(|_| ())
         }
         _ => {
             eprintln!(
-                "usage: gh_wrapper [--actions] [--draft] [--watched] | merge [--force] <pr-url> | rebase <pr-url> \
-                 | wait [--no-notify] <pr-url> | rerun <pr-run-or-job-url> | run_failed <pr-url>"
+                "usage: gh_wrapper [--actions] [--draft] [--watched] | merge [--force] [<pr-url>] | rebase <pr-url> \
+                 | wait [--no-notify] [<pr-url>] | rerun <pr-run-or-job-url> | run_failed <pr-url>"
             );
             return ExitCode::FAILURE;
         }
@@ -1342,7 +1353,22 @@ fn normalize_url(url: &str) -> String {
     }
 }
 
-fn list(with_checks: bool, show_drafts: bool, with_watched: bool) -> Result<(), String> {
+/// Prints the user's open PRs and returns the URL of the only one, for `merge`/`wait` without a
+/// URL argument. More than one (or none) is an error.
+fn sole_pr_url() -> Result<String, String> {
+    let prs = list(false, false, false)?;
+    match prs.as_slice() {
+        [pr] => Ok(pr.url.clone()),
+        [] => Err("no open PRs to pick from, pass a PR URL".into()),
+        _ => Err(format!("{} open PRs, pass a PR URL to pick one", prs.len())),
+    }
+}
+
+fn list(
+    with_checks: bool,
+    show_drafts: bool,
+    with_watched: bool,
+) -> Result<Vec<PullRequest>, String> {
     let now = Utc::now();
     let repos = if with_watched {
         watched_repos()?
@@ -1357,7 +1383,7 @@ fn list(with_checks: bool, show_drafts: bool, with_watched: bool) -> Result<(), 
     let prs = parse_prs(&list_open_prs(with_checks, &watched)?)?;
     let prs = filter_prs(prs, now, show_drafts);
     print!("{}", format_table(&prs, now, with_watched));
-    Ok(())
+    Ok(prs)
 }
 
 #[cfg(test)]
