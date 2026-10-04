@@ -78,17 +78,20 @@ impl CheckBar {
     }
 
     /// Cells for passed, failed and running: proportional, but every non-empty part gets at
-    /// least one, and together they fill `WIDTH`.
+    /// least one (running enough to fit its count), and together they fill `WIDTH`.
     fn cells(&self) -> [usize; 3] {
         let counts = [self.passed, self.failed, self.running];
         let total: usize = counts.iter().sum();
         if total == 0 {
             return [0; 3];
         }
-        let mut cells = counts.map(|c| match c {
-            0 => 0,
-            c => (c * Self::WIDTH / total).max(1),
-        });
+        let min = [1, 1, self.running.to_string().len()];
+        let mut cells = [0; 3];
+        for i in 0..3 {
+            if counts[i] > 0 {
+                cells[i] = (counts[i] * Self::WIDTH / total).max(min[i]);
+            }
+        }
         // Rounding may over- or undershoot; the largest part absorbs the difference.
         let largest = (0..3).max_by_key(|&i| cells[i]).unwrap_or(0);
         let others: usize = cells.iter().sum::<usize>() - cells[largest];
@@ -96,18 +99,24 @@ impl CheckBar {
         cells
     }
 
-    /// Green, red and yellow blocks, or None if there are no checks.
+    /// Green, red and yellow blocks, the yellow one showing how many checks are still
+    /// running; None if there are no checks.
     fn render(&self) -> Option<String> {
-        const COLORS: [&str; 3] = ["32", "31", "33"];
+        const BACKGROUNDS: [&str; 3] = ["42", "41", "43;30"];
         let cells = self.cells();
         if cells == [0; 3] {
             return None;
         }
         let mut out = String::new();
-        for (n, color) in cells.into_iter().zip(COLORS) {
-            if n > 0 {
-                out.push_str(&format!("\x1b[{color}m{}\x1b[0m", "█".repeat(n)));
+        for (i, (n, bg)) in cells.into_iter().zip(BACKGROUNDS).enumerate() {
+            if n == 0 {
+                continue;
             }
+            let text = match i {
+                2 => format!("{:^n$}", self.running),
+                _ => " ".repeat(n),
+            };
+            out.push_str(&format!("\x1b[{bg}m{text}\x1b[0m"));
         }
         Some(out)
     }
@@ -1489,6 +1498,7 @@ mod tests {
         assert!(failed >= 1 && running >= 1);
         assert_eq!(passed + failed + running, 30);
         assert!(bar(0, 0, 0).render().is_none());
+        assert!(bar(1, 0, 7).render().unwrap().contains(" 7 "));
     }
 
     #[test]
