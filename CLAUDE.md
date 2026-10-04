@@ -17,13 +17,15 @@ Startup sequence in `src/main.rs`:
 
 `gh_wrapper rerun <url>` takes an Actions job URL (`…/actions/runs/<run>/job/<job>`, as printed by `--actions`) and runs `gh run rerun --job <job> -R <host>/<owner>/<repo>` (which also reruns the job's dependencies), or a run URL (`…/actions/runs/<run>`, optionally `/attempts/<n>`) and runs `gh run rerun <run> --failed`, or a PR URL (`…/pull/<n>`, optionally followed by a tab like `/checks`), for which it fetches the head commit's CheckRuns via a GraphQL `resource(url:)` query and runs `gh run rerun <run> --failed` for every workflow run with a failed or cancelled job (`--failed` covers cancelled jobs too), continuing past runs that can't be rerun. The URL is parsed locally; anything else, e.g. non-Actions status URLs, is rejected.
 
+`gh_wrapper run_failed <pr-url>` is like `rerun` with a PR URL but leaves cancelled jobs alone (usually fail-fast siblings of a failed job): a run with failed but no cancelled jobs gets `gh run rerun <run> --failed`, while one that also has cancelled jobs gets `gh run rerun --job <job>` per failed job (the CheckRun's `databaseId` is the job id), since `--failed` would rerun the cancelled ones too.
+
 `gh_wrapper wait <pr-url>` polls the same `resource(url:)` query (plus title/repo) every 30s until CI succeeds or fails, following force pushes; "no checks" counts as pending for 5 minutes per head commit, then aborts. It then shows a critical desktop notification by calling the freedesktop `org.freedesktop.Notifications.Notify` D-Bus method through `gdbus` (not `notify-send`, so libnotify isn't needed), with Merge (only when green) and Open buttons. A `gdbus monitor` started before the notification catches the `ActionInvoked`/`NotificationClosed` signal for its id; Merge merges the head commit that passed (no re-wait), Open runs `xdg-open`. With `--no-notify` (before or after the URL) no notification is shown, only the terminal output and the exit status (0 green, 1 otherwise) report the result, so it can be used in scripts. Failed CI exits 1; notification errors are only warnings. On macOS (no D-Bus) the notification is instead an `osascript` `display alert` with the actions plus a Dismiss button, and Open runs `open`.
 
 `gh_wrapper pr <branch>` refuses `main`/`master` and anything that isn't a local branch (`refs/heads/<branch>`), then runs `git push --force origin <branch>` and `gh pr create --head <branch> --fill` (non-interactive; title/body from the commits).
 
 Setting `GHW_DEBUG` (any value) logs every subprocess to stderr as `[GHW_DEBUG] $ <command line>` before it runs (long arguments like GraphQL queries truncated) and `took <n>s` after, to find slow or hanging steps. All subprocesses go through the `Traced` trait's `traced_status`/`traced_output`/`traced_spawn` instead of `Command::status`/`output`/`spawn`, so new ones should too.
 
-Every subcommand taking a URL (`merge`, `rebase`, `wait`, `rerun`) first runs it through `normalize_url`, which prepends `https:` to a scheme-less `//host/…` URL (macOS double-click doesn't select the `https:` part).
+Every subcommand taking a URL (`merge`, `rebase`, `wait`, `rerun`, `run_failed`) first runs it through `normalize_url`, which prepends `https:` to a scheme-less `//host/…` URL (macOS double-click doesn't select the `https:` part).
 
 ## Commands
 
