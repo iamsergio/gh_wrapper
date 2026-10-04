@@ -50,6 +50,15 @@ struct PullRequest {
     checks: Vec<Check>,
 }
 
+/// An Actions run with failed or cancelled jobs.
+#[derive(Debug, PartialEq)]
+struct FailedRun {
+    id: u64,
+    /// Job ids, excluding cancelled jobs.
+    failed_jobs: Vec<u64>,
+    has_cancelled: bool,
+}
+
 #[derive(Debug, PartialEq)]
 struct Check {
     name: String,
@@ -132,6 +141,8 @@ struct Contexts {
 #[serde(tag = "__typename", rename_all_fields = "camelCase")]
 enum CheckContext {
     CheckRun {
+        /// For Actions, the job id.
+        database_id: u64,
         name: String,
         status: String,
         conclusion: Option<String>,
@@ -172,6 +183,7 @@ impl From<CheckContext> for Check {
                 conclusion,
                 details_url,
                 check_suite,
+                ..
             } => {
                 let ci = match (status.as_str(), conclusion.as_deref()) {
                     ("COMPLETED", c) if is_passing(c) => CiStatus::Success,
@@ -259,10 +271,11 @@ impl Commits {
     }
 
     /// Actions runs with a failed or cancelled job, in GitHub's order.
-    fn failed_run_ids(self) -> Vec<u64> {
-        let mut ids = Vec::new();
+    fn failed_runs(self) -> Vec<FailedRun> {
+        let mut runs: Vec<FailedRun> = Vec::new();
         for context in self.into_contexts() {
             if let CheckContext::CheckRun {
+                database_id,
                 status,
                 conclusion,
                 check_suite:
@@ -273,12 +286,27 @@ impl Commits {
             } = context
                 && status == "COMPLETED"
                 && !is_passing(conclusion.as_deref())
-                && !ids.contains(&run.database_id)
             {
-                ids.push(run.database_id);
+                let index = runs
+                    .iter()
+                    .position(|r| r.id == run.database_id)
+                    .unwrap_or_else(|| {
+                        runs.push(FailedRun {
+                            id: run.database_id,
+                            failed_jobs: Vec::new(),
+                            has_cancelled: false,
+                        });
+                        runs.len() - 1
+                    });
+                let failed_run = &mut runs[index];
+                if conclusion.as_deref() == Some("CANCELLED") {
+                    failed_run.has_cancelled = true;
+                } else {
+                    failed_run.failed_jobs.push(database_id);
+                }
             }
         }
-        ids
+        runs
     }
 }
 
@@ -353,7 +381,7 @@ const CONTEXTS: &str = "contexts(first: 100) {
   nodes {
     __typename
     ... on CheckRun {
-      name status conclusion detailsUrl
+      databaseId name status conclusion detailsUrl
       checkSuite { workflowRun { databaseId workflow { name } } }
     }
     ... on StatusContext { context state targetUrl }
@@ -435,7 +463,7 @@ fn parse_pr_info(json: &str) -> Result<PrInfo, String> {
     })
 }
 
-fn parse_failed_run_ids(json: &str) -> Result<Vec<u64>, String> {
+fn parse_failed_runs(json: &str) -> Result<Vec<FailedRun>, String> {
     let response: ResourceResponse =
         serde_json::from_str(json).map_err(|e| format!("failed to parse gh output: {e}"))?;
     let not_a_pr = || "not a pull request URL".to_string();
@@ -444,7 +472,12 @@ fn parse_failed_run_ids(json: &str) -> Result<Vec<u64>, String> {
         .resource
         .and_then(|r| r.commits)
         .ok_or_else(not_a_pr)?;
-    Ok(commits.failed_run_ids())
+    Ok(commits.failed_runs())
+}
+
+fn fetch_failed_runs(url: &str) -> Result<Vec<FailedRun>, String> {
+    let query = PR_RUNS_QUERY.replace("CONTEXTS", CONTEXTS);
+    parse_failed_runs(&gh_graphql(&query, &[("url", url)])?)
 }
 
 fn fetch_pr_info(url: &str) -> Result<PrInfo, String> {
@@ -564,26 +597,52 @@ fn parse_pr_url(url: &str) -> Option<(String, String)> {
 /// Reruns the failed and cancelled jobs (plus their dependents) of every Actions run on the
 /// PR's head commit. `gh run rerun --failed` covers cancelled jobs too.
 fn rerun_pr(repo: &str, url: &str) -> Result<(), String> {
-    let query = PR_RUNS_QUERY.replace("CONTEXTS", CONTEXTS);
-    let run_ids = parse_failed_run_ids(&gh_graphql(&query, &[("url", url)])?)?;
-    if run_ids.is_empty() {
+    let runs = fetch_failed_runs(url)?;
+    if runs.is_empty() {
         return Err("no failed or cancelled Actions jobs to rerun".to_string());
     }
-    // Keep going, so that one run that can't be rerun (e.g. still in progress) doesn't block
-    // the others.
+    let reruns: Vec<_> = runs
+        .iter()
+        .map(|run| vec![run.id.to_string(), "--failed".to_string()])
+        .collect();
+    rerun_each(repo, &reruns)
+}
+
+/// Like `rerun_pr`, but leaves cancelled jobs alone, as they're usually fail-fast siblings of
+/// a failed job. `--failed` would rerun them too, so runs that have any are rerun job by job.
+fn run_failed(url: &str) -> Result<(), String> {
+    let (repo, url) = parse_pr_url(url).ok_or_else(|| format!("not a pull request URL: {url}"))?;
+    let mut reruns = Vec::new();
+    for run in fetch_failed_runs(&url)? {
+        if !run.has_cancelled {
+            reruns.push(vec![run.id.to_string(), "--failed".to_string()]);
+            continue;
+        }
+        for job in run.failed_jobs {
+            reruns.push(vec!["--job".to_string(), job.to_string()]);
+        }
+    }
+    if reruns.is_empty() {
+        return Err("no failed Actions jobs to rerun".to_string());
+    }
+    rerun_each(&repo, &reruns)
+}
+
+/// Runs `gh run rerun <args> -R <repo>` for each of `reruns`. Keeps going, so that one that
+/// can't be rerun (e.g. still in progress) doesn't block the others.
+fn rerun_each(repo: &str, reruns: &[Vec<String>]) -> Result<(), String> {
     let mut failures = 0;
-    for id in &run_ids {
-        let id = id.to_string();
-        if let Err(e) = run("gh", &["run", "rerun", &id, "--failed", "-R", repo]) {
+    for args in reruns {
+        let mut args: Vec<&str> = args.iter().map(String::as_str).collect();
+        args.splice(0..0, ["run", "rerun"]);
+        args.extend(["-R", repo]);
+        if let Err(e) = run("gh", &args) {
             eprintln!("error: {e}");
             failures += 1;
         }
     }
     if failures > 0 {
-        return Err(format!(
-            "{failures} of {} runs failed to rerun",
-            run_ids.len()
-        ));
+        return Err(format!("{failures} of {} reruns failed", reruns.len()));
     }
     Ok(())
 }
@@ -1181,6 +1240,7 @@ fn main() -> ExitCode {
             false,
         ),
         [cmd, url] if cmd == "rerun" => rerun(&normalize_url(url)),
+        [cmd, url] if cmd == "run_failed" => run_failed(&normalize_url(url)),
         [cmd, branch] if cmd == "pr" => create_pr(branch),
         flags
             if flags
@@ -1193,7 +1253,8 @@ fn main() -> ExitCode {
         _ => {
             eprintln!(
                 "usage: gh_wrapper [--actions] [--draft] [--watched] | merge [--force] <pr-url> | rebase <pr-url> \
-                 | wait [--no-notify] <pr-url> | rerun <pr-run-or-job-url> | pr <branch>"
+                 | wait [--no-notify] <pr-url> | rerun <pr-run-or-job-url> | run_failed <pr-url> \
+                 | pr <branch>"
             );
             return ExitCode::FAILURE;
         }
@@ -1486,20 +1547,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_failed_run_ids_includes_cancelled_and_dedups() {
-        let job = |run: u64, status: &str, conclusion: &str| {
+    fn parse_failed_runs_groups_jobs_by_run() {
+        let job = |run: u64, job: u64, status: &str, conclusion: &str| {
             format!(
-                r#"{{"__typename":"CheckRun","name":"j","status":"{status}","conclusion":{conclusion},
+                r#"{{"__typename":"CheckRun","databaseId":{job},"name":"j","status":"{status}","conclusion":{conclusion},
                 "detailsUrl":null,"checkSuite":{{"workflowRun":{{"databaseId":{run},"workflow":{{"name":"w"}}}}}}}}"#
             )
         };
         let contexts = [
-            job(1, "COMPLETED", r#""SUCCESS""#),
-            job(2, "COMPLETED", r#""FAILURE""#),
-            job(3, "COMPLETED", r#""CANCELLED""#),
-            job(2, "COMPLETED", r#""TIMED_OUT""#),
-            job(4, "IN_PROGRESS", "null"),
-            job(5, "COMPLETED", r#""SKIPPED""#),
+            job(1, 10, "COMPLETED", r#""SUCCESS""#),
+            job(2, 20, "COMPLETED", r#""FAILURE""#),
+            job(3, 30, "COMPLETED", r#""CANCELLED""#),
+            job(2, 21, "COMPLETED", r#""TIMED_OUT""#),
+            job(4, 40, "IN_PROGRESS", "null"),
+            job(5, 50, "COMPLETED", r#""SKIPPED""#),
+            job(2, 22, "COMPLETED", r#""CANCELLED""#),
             r#"{"__typename":"StatusContext","context":"c","state":"FAILURE","targetUrl":null}"#
                 .to_string(),
         ]
@@ -1508,8 +1570,19 @@ mod tests {
             r#"{{"data":{{"resource":{{"commits":{{"nodes":[{{"commit":{{"statusCheckRollup":
             {{"state":"FAILURE","contexts":{{"nodes":[{contexts}]}}}}}}}}]}}}}}}}}"#
         );
-        assert_eq!(parse_failed_run_ids(&json), Ok(vec![2, 3]));
-        assert!(parse_failed_run_ids(r#"{"data":{"resource":{}}}"#).is_err());
+        let failed_run = |id, failed_jobs, has_cancelled| FailedRun {
+            id,
+            failed_jobs,
+            has_cancelled,
+        };
+        assert_eq!(
+            parse_failed_runs(&json),
+            Ok(vec![
+                failed_run(2, vec![20, 21], true),
+                failed_run(3, vec![], true)
+            ])
+        );
+        assert!(parse_failed_runs(r#"{"data":{"resource":{}}}"#).is_err());
     }
 
     #[test]
@@ -1666,12 +1739,12 @@ CI  REPO                AUTHOR  TITLE          URL          LAST UPDATED
         let json = r#"{"data":{"search":{"nodes":[{"repository":{"nameWithOwner":"o/r"},
             "author":null,"title":"t","url":"https://a/1","updatedAt":"2026-01-01T00:00:00Z","isDraft":false,
             "commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"FAILURE","contexts":{"nodes":[
-                {"__typename":"CheckRun","name":"ok","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"u1","checkSuite":null},
-                {"__typename":"CheckRun","name":"skipped","status":"COMPLETED","conclusion":"SKIPPED","detailsUrl":"u2","checkSuite":null},
-                {"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"TIMED_OUT","detailsUrl":"u3",
+                {"__typename":"CheckRun","databaseId":1,"name":"ok","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"u1","checkSuite":null},
+                {"__typename":"CheckRun","databaseId":1,"name":"skipped","status":"COMPLETED","conclusion":"SKIPPED","detailsUrl":"u2","checkSuite":null},
+                {"__typename":"CheckRun","databaseId":1,"name":"build","status":"COMPLETED","conclusion":"TIMED_OUT","detailsUrl":"u3",
                     "checkSuite":{"workflowRun":{"databaseId":1,"workflow":{"name":"CI"}}}},
-                {"__typename":"CheckRun","name":"cancelled","status":"COMPLETED","conclusion":"CANCELLED","detailsUrl":"u6","checkSuite":null},
-                {"__typename":"CheckRun","name":"test","status":"QUEUED","conclusion":null,"detailsUrl":null,"checkSuite":null},
+                {"__typename":"CheckRun","databaseId":1,"name":"cancelled","status":"COMPLETED","conclusion":"CANCELLED","detailsUrl":"u6","checkSuite":null},
+                {"__typename":"CheckRun","databaseId":1,"name":"test","status":"QUEUED","conclusion":null,"detailsUrl":null,"checkSuite":null},
                 {"__typename":"StatusContext","context":"ext/ci","state":"ERROR","targetUrl":"u5"},
                 {"__typename":"StatusContext","context":"ext/ok","state":"SUCCESS","targetUrl":null}
             ]}}}}]}}]}}}"#;
