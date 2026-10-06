@@ -1315,7 +1315,7 @@ fn main() -> ExitCode {
             &normalize_url(if a == "--no-notify" { b } else { a }),
             false,
         ),
-        [cmd, url] if cmd == "rerun" => rerun(&normalize_url(url)),
+        [cmd, url] if cmd == "rerun" => rerun_urls(url),
         [cmd, url] if cmd == "run_failed" => run_failed(&normalize_url(url)),
         flags
             if flags
@@ -1328,7 +1328,7 @@ fn main() -> ExitCode {
         _ => {
             eprintln!(
                 "usage: gh_wrapper [--actions] [--draft] [--watched] | merge [--force] [<pr-url>[,<pr-url>...]] | rebase <pr-url> \
-                 | wait [--no-notify] [<pr-url>] | rerun <pr-run-or-job-url> | run_failed <pr-url>"
+                 | wait [--no-notify] [<pr-url>] | rerun <pr-run-or-job-url>[,<url>...] | run_failed <pr-url>"
             );
             return ExitCode::FAILURE;
         }
@@ -1343,29 +1343,47 @@ fn main() -> ExitCode {
     }
 }
 
-/// Merges each PR of a comma-separated URL list in order, continuing past failures and
-/// reporting them at the end.
-fn merge_prs(urls: &str, force: bool) -> Result<(), String> {
-    let urls: Vec<&str> = urls
-        .split(',')
+/// Splits a comma-separated URL list, dropping empty entries.
+fn split_urls(urls: &str) -> Vec<&str> {
+    urls.split(',')
         .map(str::trim)
         .filter(|u| !u.is_empty())
-        .collect();
-    let mut failed = Vec::new();
+        .collect()
+}
+
+/// Runs `action` on each URL of a comma-separated list in order, continuing past failures and
+/// reporting them at the end. `what` names the action in the summary, e.g. "merges".
+fn for_each_url(
+    urls: &str,
+    what: &str,
+    mut action: impl FnMut(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    let urls = split_urls(urls);
+    let mut failed = 0;
     for url in &urls {
-        if let Err(e) = merge_pr(&normalize_url(url), force) {
+        if let Err(e) = action(&normalize_url(url)) {
             if urls.len() == 1 {
                 return Err(e);
             }
             eprintln!("error: {url}: {e}");
-            failed.push(*url);
+            failed += 1;
         }
     }
-    if failed.is_empty() {
+    if failed == 0 {
         Ok(())
     } else {
-        Err(format!("{} of {} merges failed", failed.len(), urls.len()))
+        Err(format!("{failed} of {} {what} failed", urls.len()))
     }
+}
+
+/// Merges each PR of a comma-separated URL list.
+fn merge_prs(urls: &str, force: bool) -> Result<(), String> {
+    for_each_url(urls, "merges", |url| merge_pr(url, force))
+}
+
+/// Reruns each URL of a comma-separated list.
+fn rerun_urls(urls: &str) -> Result<(), String> {
+    for_each_url(urls, "reruns", rerun)
 }
 
 /// Prepends `https:` to a scheme-less `//host/...` URL: on macOS, double-clicking a URL doesn't
