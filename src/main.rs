@@ -1305,9 +1305,9 @@ fn main() -> ExitCode {
         }
     }
     let result = match args.as_slice() {
-        [cmd, url] if cmd == "merge" => merge_pr(&normalize_url(url), false),
+        [cmd, url] if cmd == "merge" => merge_prs(url, false),
         [cmd, a, b] if cmd == "merge" && (a == "--force" || b == "--force") => {
-            merge_pr(&normalize_url(if a == "--force" { b } else { a }), true)
+            merge_prs(if a == "--force" { b } else { a }, true)
         }
         [cmd, url] if cmd == "rebase" => rebase_pr(&normalize_url(url)),
         [cmd, url] if cmd == "wait" => wait_pr(&normalize_url(url), true),
@@ -1327,7 +1327,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: gh_wrapper [--actions] [--draft] [--watched] | merge [--force] [<pr-url>] | rebase <pr-url> \
+                "usage: gh_wrapper [--actions] [--draft] [--watched] | merge [--force] [<pr-url>[,<pr-url>...]] | rebase <pr-url> \
                  | wait [--no-notify] [<pr-url>] | rerun <pr-run-or-job-url> | run_failed <pr-url>"
             );
             return ExitCode::FAILURE;
@@ -1340,6 +1340,31 @@ fn main() -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Merges each PR of a comma-separated URL list in order, continuing past failures and
+/// reporting them at the end.
+fn merge_prs(urls: &str, force: bool) -> Result<(), String> {
+    let urls: Vec<&str> = urls
+        .split(',')
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .collect();
+    let mut failed = Vec::new();
+    for url in &urls {
+        if let Err(e) = merge_pr(&normalize_url(url), force) {
+            if urls.len() == 1 {
+                return Err(e);
+            }
+            eprintln!("error: {url}: {e}");
+            failed.push(*url);
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{} of {} merges failed", failed.len(), urls.len()))
     }
 }
 
