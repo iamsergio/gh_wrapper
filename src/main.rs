@@ -50,6 +50,9 @@ struct PullRequest {
     checks: Vec<Check>,
     /// Tally of all checks; empty unless fetched with `--actions`.
     bar: CheckBar,
+    /// Actions runs of the head commit waiting for a maintainer's approval (first-time
+    /// contributors' PRs); `authorize` approves them.
+    needs_approval: bool,
 }
 
 /// How many checks passed, failed or are still running (cancelled ones are left out, see
@@ -194,6 +197,26 @@ struct CommitNode {
 #[serde(rename_all = "camelCase")]
 struct Commit {
     status_check_rollup: Option<Rollup>,
+    /// Absent unless the query asked for it.
+    check_suites: Option<CheckSuites>,
+}
+
+#[derive(Deserialize)]
+struct CheckSuites {
+    nodes: Vec<SuiteNode>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SuiteNode {
+    conclusion: Option<String>,
+    workflow_run: Option<RunId>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunId {
+    database_id: u64,
 }
 
 #[derive(Deserialize)]
@@ -321,6 +344,21 @@ impl Commits {
         CiStatus::from_rollup_state(state)
     }
 
+    /// Ids of the head commit's Actions runs that wait for approval. Such runs have no jobs
+    /// yet, so the rollup is null and they show up only as suites concluded `ACTION_REQUIRED`.
+    fn approval_runs(&self) -> Vec<u64> {
+        let suites = self
+            .nodes
+            .first()
+            .and_then(|c| c.commit.check_suites.as_ref());
+        suites
+            .into_iter()
+            .flat_map(|s| &s.nodes)
+            .filter(|s| s.conclusion.as_deref() == Some("ACTION_REQUIRED"))
+            .filter_map(|s| s.workflow_run.as_ref().map(|r| r.database_id))
+            .collect()
+    }
+
     fn into_contexts(self) -> Vec<CheckContext> {
         self.nodes
             .into_iter()
@@ -386,6 +424,7 @@ impl Commits {
 impl From<PrNode> for PullRequest {
     fn from(node: PrNode) -> Self {
         let ci = node.commits.ci_status();
+        let needs_approval = !node.commits.approval_runs().is_empty();
         let (bar, checks) = node.commits.tally_and_checks();
         Self {
             ci,
@@ -397,6 +436,7 @@ impl From<PrNode> for PullRequest {
             is_draft: node.is_draft,
             checks,
             bar,
+            needs_approval,
         }
     }
 }
@@ -416,7 +456,9 @@ fragment Pr on PullRequest {
   url
   updatedAt
   isDraft
-  commits(last: 1) { nodes { commit { statusCheckRollup { state CONTEXTS } } } }
+  commits(last: 1) {
+    nodes { commit { statusCheckRollup { state CONTEXTS } CHECK_SUITES } }
+  }
 }";
 
 /// How recently a watched repo's PR must have been opened to be listed.
@@ -461,6 +503,19 @@ const CONTEXTS: &str = "contexts(first: 100) {
       checkSuite { workflowRun { databaseId workflow { name } } }
     }
     ... on StatusContext { context state targetUrl }
+  }
+}";
+
+// Suites of the head commit; those concluded ACTION_REQUIRED wait for approval, see
+// `Commits::approval_runs`.
+const CHECK_SUITES: &str =
+    "checkSuites(first: 50) { nodes { conclusion workflowRun { databaseId } } }";
+
+const PR_APPROVAL_QUERY: &str = "query($url: URI!) {
+  resource(url: $url) {
+    ... on PullRequest {
+      commits(last: 1) { nodes { commit { CHECK_SUITES } } }
+    }
   }
 }";
 
@@ -554,6 +609,53 @@ fn parse_failed_runs(json: &str) -> Result<Vec<FailedRun>, String> {
 fn fetch_failed_runs(url: &str) -> Result<Vec<FailedRun>, String> {
     let query = PR_RUNS_QUERY.replace("CONTEXTS", CONTEXTS);
     parse_failed_runs(&gh_graphql(&query, &[("url", url)])?)
+}
+
+fn parse_approval_runs(json: &str) -> Result<Vec<u64>, String> {
+    let response: ResourceResponse =
+        serde_json::from_str(json).map_err(|e| format!("failed to parse gh output: {e}"))?;
+    let commits = response
+        .data
+        .resource
+        .and_then(|r| r.commits)
+        .ok_or("not a pull request URL")?;
+    Ok(commits.approval_runs())
+}
+
+/// Approves the Actions runs of the PR's head commit that wait for a maintainer's approval
+/// (the "Approve and run" button). Keeps going past runs that can't be approved.
+fn authorize(url: &str) -> Result<(), String> {
+    let (repo, url) = parse_pr_url(url).ok_or_else(|| format!("not a pull request URL: {url}"))?;
+    let query = PR_APPROVAL_QUERY.replace("CHECK_SUITES", CHECK_SUITES);
+    let runs = parse_approval_runs(&gh_graphql(&query, &[("url", &url)])?)?;
+    if runs.is_empty() {
+        println!("No Actions runs awaiting approval for {url}");
+        return Ok(());
+    }
+    // `repo` is `<host>/<owner>/<repo>`; the REST path takes the last two.
+    let (host, path) = repo.split_once('/').ok_or("invalid repository")?;
+    let mut failures = 0;
+    for id in &runs {
+        let endpoint = format!("repos/{path}/actions/runs/{id}/approve");
+        let args = [
+            "api",
+            "--silent",
+            "-X",
+            "POST",
+            "--hostname",
+            host,
+            &endpoint,
+        ];
+        if let Err(e) = run("gh", &args) {
+            eprintln!("error: {e}");
+            failures += 1;
+        }
+    }
+    if failures > 0 {
+        return Err(format!("{failures} of {} approvals failed", runs.len()));
+    }
+    println!("Approved {} Actions runs of {url}", runs.len());
+    Ok(())
 }
 
 fn fetch_pr_info(url: &str) -> Result<PrInfo, String> {
@@ -1151,6 +1253,7 @@ fn list_open_prs(with_checks: bool, watched: &str) -> Result<String, String> {
     let contexts = if with_checks { CONTEXTS } else { "" };
     let query = QUERY
         .replace("CONTEXTS", contexts)
+        .replace("CHECK_SUITES", CHECK_SUITES)
         .replace("WATCHED", watched);
     gh_graphql(&query, &[])
 }
@@ -1194,6 +1297,16 @@ fn filter_prs(prs: Vec<PullRequest>, now: DateTime<Utc>, show_drafts: bool) -> V
     prs.into_iter()
         .filter(|pr| !is_hidden(pr, now, show_drafts))
         .collect()
+}
+
+/// The command that approves the Actions runs waiting on the listed PRs, if there are any.
+fn approval_hint(prs: &[PullRequest]) -> Option<String> {
+    let urls: Vec<&str> = prs
+        .iter()
+        .filter(|pr| pr.needs_approval)
+        .map(|pr| pr.url.as_str())
+        .collect();
+    (!urls.is_empty()).then(|| format!("Runs awaiting approval: ghw authorize {}", urls.join(",")))
 }
 
 fn format_table(prs: &[PullRequest], now: DateTime<Utc>, show_author: bool) -> String {
@@ -1240,7 +1353,10 @@ fn format_table(prs: &[PullRequest], now: DateTime<Utc>, show_author: bool) -> S
 
     // The CI column is always a single emoji (2 terminal columns, same as the "CI" header),
     // so it's kept out of the width calculation, which counts chars.
-    let icons = std::iter::once("CI").chain(prs.iter().map(|pr| pr.ci.icon()));
+    let icons = std::iter::once("CI").chain(prs.iter().map(|pr| match pr.needs_approval {
+        true if pr.ci == CiStatus::None => "🔒",
+        _ => pr.ci.icon(),
+    }));
 
     let mut out = String::new();
     let no_checks: &[Check] = &[];
@@ -1317,6 +1433,7 @@ fn main() -> ExitCode {
         ),
         [cmd, url] if cmd == "rerun" => rerun_urls(url),
         [cmd, url] if cmd == "run_failed" => run_failed(&normalize_url(url)),
+        [cmd, urls] if cmd == "authorize" => for_each_url(urls, "approvals", authorize),
         flags
             if flags
                 .iter()
@@ -1328,7 +1445,7 @@ fn main() -> ExitCode {
         _ => {
             eprintln!(
                 "usage: gh_wrapper [--actions] [--draft] [--watched] | merge [--force] [<pr-url>[,<pr-url>...]] | rebase <pr-url> \
-                 | wait [--no-notify] [<pr-url>] | rerun <pr-run-or-job-url>[,<url>...] | run_failed <pr-url>"
+                 | wait [--no-notify] [<pr-url>] | rerun <pr-run-or-job-url>[,<url>...] | run_failed <pr-url> | authorize <pr-url>[,<pr-url>...]"
             );
             return ExitCode::FAILURE;
         }
@@ -1426,6 +1543,9 @@ fn list(
     let prs = parse_prs(&list_open_prs(with_checks, &watched)?)?;
     let prs = filter_prs(prs, now, show_drafts);
     print!("{}", format_table(&prs, now, with_watched));
+    if let Some(hint) = approval_hint(&prs) {
+        println!("\n{hint}");
+    }
     Ok(prs)
 }
 
@@ -1519,6 +1639,7 @@ mod tests {
             is_draft: false,
             checks: vec![],
             bar: CheckBar::default(),
+            needs_approval: false,
         }
     }
 
@@ -1727,6 +1848,42 @@ mod tests {
             ])
         );
         assert!(parse_failed_runs(r#"{"data":{"resource":{}}}"#).is_err());
+    }
+
+    #[test]
+    fn parse_approval_runs_picks_action_required_suites() {
+        let suite = |conclusion: &str, run: &str| {
+            format!(r#"{{"conclusion":{conclusion},"workflowRun":{run}}}"#)
+        };
+        let suites = [
+            suite("null", "null"),
+            suite(r#""ACTION_REQUIRED""#, r#"{"databaseId":7}"#),
+            suite(r#""SUCCESS""#, r#"{"databaseId":8}"#),
+            suite(r#""ACTION_REQUIRED""#, r#"{"databaseId":9}"#),
+        ]
+        .join(",");
+        let json = format!(
+            r#"{{"data":{{"resource":{{"commits":{{"nodes":[{{"commit":{{"checkSuites":{{"nodes":[{suites}]}}}}}}]}}}}}}}}"#
+        );
+        assert_eq!(parse_approval_runs(&json), Ok(vec![7, 9]));
+        assert!(parse_approval_runs(r#"{"data":{"resource":{}}}"#).is_err());
+    }
+
+    #[test]
+    fn approval_hint_lists_urls_of_prs_needing_approval() {
+        let mut a = pr("a", "2026-09-24T21:00:00Z");
+        a.url = "https://h/o/r/pull/1".into();
+        a.needs_approval = true;
+        let mut b = pr("b", "2026-09-24T21:00:00Z");
+        b.url = "https://h/o/r/pull/2".into();
+        let mut c = pr("c", "2026-09-24T21:00:00Z");
+        c.needs_approval = true;
+        c.url = "https://h/o/r/pull/3".into();
+        assert_eq!(approval_hint(&[b]), None);
+        assert_eq!(
+            approval_hint(&[a, c]).as_deref(),
+            Some("Runs awaiting approval: ghw authorize https://h/o/r/pull/1,https://h/o/r/pull/3")
+        );
     }
 
     #[test]
