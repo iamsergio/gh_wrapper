@@ -928,9 +928,9 @@ fn notify_pr(
         &actions[1..]
     };
     let body = format!("{}: {}", pr.repo, pr.title);
-    match notify(summary, &body, icon, actions) {
+    match notify(summary, &body, url, icon, actions) {
         Ok(Some(action)) if action == "merge" => merge_head(url, pr)?,
-        Ok(Some(action)) if action == "open" => run(
+        Ok(Some(action)) if action == "open" || action == "default" => run(
             if cfg!(target_os = "macos") {
                 "open"
             } else {
@@ -958,6 +958,7 @@ const NOTIFICATIONS: [&str; 4] = [
 fn notify(
     summary: &str,
     body: &str,
+    url: &str,
     icon: &str,
     actions: &[(&str, &str)],
 ) -> Result<Option<String>, String> {
@@ -970,7 +971,7 @@ fn notify(
         .stdout(Stdio::piped())
         .traced_spawn()
         .map_err(|e| format!("failed to run gdbus: {e}"))?;
-    let result = show_notification(&mut monitor, summary, body, icon, actions);
+    let result = show_notification(&mut monitor, summary, body, url, icon, actions);
     let _ = monitor.kill();
     let _ = monitor.wait();
     result
@@ -1015,6 +1016,7 @@ fn show_notification(
     monitor: &mut Child,
     summary: &str,
     body: &str,
+    url: &str,
     icon: &str,
     actions: &[(&str, &str)],
 ) -> Result<Option<String>, String> {
@@ -1023,8 +1025,11 @@ fn show_notification(
     // gdbus prints this once subscribed, so a click can't come before we listen for it.
     lines.next();
 
-    let actions: Vec<String> = actions
+    // "default" is invoked by clicking the notification body; most servers don't draw a button
+    // for it.
+    let actions: Vec<String> = [("default", "Open")]
         .iter()
+        .chain(actions)
         .flat_map(|(key, label)| [gvariant_string(key), gvariant_string(label)])
         .collect();
     let output = Command::new("gdbus")
@@ -1037,7 +1042,12 @@ fn show_notification(
             "0".to_string(),
             gvariant_string(icon),
             gvariant_string(summary),
-            gvariant_string(&escape_markup(body)),
+            gvariant_string(&format!(
+                "{}\n<a href=\"{}\">{}</a>",
+                escape_markup(body),
+                escape_markup(url),
+                escape_markup(url)
+            )),
             format!("[{}]", actions.join(", ")),
             // Critical notifications stay on screen until dismissed.
             "{'urgency': <byte 2>}".to_string(),
