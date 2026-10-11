@@ -1408,6 +1408,20 @@ fn format_table(prs: &[PullRequest], now: DateTime<Utc>, show_author: bool) -> S
 }
 
 fn main() -> ExitCode {
+    // Needs neither `gh` nor authentication.
+    let cli: Vec<String> = std::env::args().skip(1).collect();
+    if let [cmd, shell] = cli.as_slice()
+        && cmd == "completions"
+    {
+        return if shell == "zsh" {
+            print!("{}", include_str!("completions/gh_wrapper.zsh"));
+            ExitCode::SUCCESS
+        } else {
+            eprintln!("error: unsupported shell '{shell}'. Supported shells: zsh");
+            ExitCode::FAILURE
+        };
+    }
+
     if !gh_installed() {
         eprintln!("error: `gh` is not installed. See https://cli.github.com/");
         return ExitCode::FAILURE;
@@ -1455,7 +1469,7 @@ fn main() -> ExitCode {
         _ => {
             eprintln!(
                 "usage: gh_wrapper [--actions] [--draft] [--watched] | merge [--force] [<pr-url>[,<pr-url>...]] | rebase <pr-url> \
-                 | wait [--no-notify] [<pr-url>] | rerun <pr-run-or-job-url>[,<url>...] | run_failed <pr-url> | authorize <pr-url>[,<pr-url>...]"
+                 | wait [--no-notify] [<pr-url>] | rerun <pr-run-or-job-url>[,<url>...] | run_failed <pr-url> | authorize <pr-url>[,<pr-url>...] | completions zsh"
             );
             return ExitCode::FAILURE;
         }
