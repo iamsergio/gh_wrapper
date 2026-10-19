@@ -9,6 +9,7 @@ _gh_wrapper() {
         'rerun:Rerun a failed job, run or PR'\''s failed runs'
         'run_failed:Rerun a PR'\''s failed jobs, leaving cancelled ones alone'
         'authorize:Approve Actions runs awaiting approval'
+        'runners:List self-hosted runners of the repos in $GHW_CONFIG_FILE'
         'completions:Print the shell completion script'
     )
 
@@ -37,6 +38,8 @@ _gh_wrapper() {
             _arguments '*:PR, run or job URL(s), comma-separated: ' ;;
         authorize)
             _arguments '*:PR URL(s), comma-separated: ' ;;
+        runners)
+            ;;
         completions)
             (( CURRENT == 3 )) && _values 'shell' zsh ;;
         *)

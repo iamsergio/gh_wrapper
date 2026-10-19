@@ -721,6 +721,248 @@ fn rebase_pr(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+const CONFIG_ENV: &str = "GHW_CONFIG_FILE";
+
+#[derive(Debug, Default, Deserialize)]
+struct Config {
+    #[serde(default)]
+    runners: RunnersConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RunnersConfig {
+    /// `owner/repo` names whose self-hosted runners `runners` lists.
+    #[serde(default)]
+    repos: Vec<String>,
+}
+
+fn load_config() -> Result<Config, String> {
+    let path = std::env::var(CONFIG_ENV).map_err(|_| format!("{CONFIG_ENV} is not set"))?;
+    let json = std::fs::read_to_string(&path).map_err(|e| format!("failed to read {path}: {e}"))?;
+    serde_json::from_str(&json).map_err(|e| format!("failed to parse {path}: {e}"))
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+struct Runner {
+    name: String,
+    os: String,
+    status: String,
+    busy: bool,
+    labels: Vec<RunnerLabel>,
+    /// The job a busy runner is running; filled in by `fetch_runners`.
+    #[serde(skip)]
+    job: Option<RunnerJob>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Clone)]
+struct RunnerJob {
+    name: String,
+    workflow_name: String,
+    head_branch: String,
+    started_at: String,
+    html_url: String,
+    status: String,
+    runner_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct JobsResponse {
+    jobs: Vec<RunnerJob>,
+}
+
+#[derive(Deserialize)]
+struct RunsResponse {
+    workflow_runs: Vec<InProgressRun>,
+}
+
+#[derive(Deserialize)]
+struct InProgressRun {
+    id: u64,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+struct RunnerLabel {
+    name: String,
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+impl Runner {
+    fn icon(&self) -> &'static str {
+        match (self.status.as_str(), self.busy) {
+            ("online", true) => "🟡",
+            ("online", false) => "🟢",
+            _ => "⚫",
+        }
+    }
+
+    /// Only the custom labels; the read-only ones repeat `self-hosted` and the OS/arch.
+    fn custom_labels(&self) -> String {
+        self.labels
+            .iter()
+            .filter(|l| l.kind == "custom")
+            .map(|l| l.name.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+#[derive(Deserialize)]
+struct RunnersResponse {
+    runners: Vec<Runner>,
+}
+
+fn parse_runners(json: &str) -> Result<Vec<Runner>, String> {
+    serde_json::from_str::<RunnersResponse>(json)
+        .map(|r| r.runners)
+        .map_err(|e| format!("failed to parse gh output: {e}"))
+}
+
+fn gh_rest(endpoint: &str) -> Result<String, String> {
+    let output = Command::new("gh")
+        .args(["api", endpoint])
+        .stderr(Stdio::inherit())
+        .traced_output()
+        .map_err(|e| format!("failed to run gh: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("`gh api {endpoint}` failed"));
+    }
+    String::from_utf8(output.stdout).map_err(|e| format!("gh returned invalid UTF-8: {e}"))
+}
+
+/// Needs admin rights on the repo.
+fn fetch_runners(repo: &str) -> Result<Vec<Runner>, String> {
+    let mut runners = parse_runners(&gh_rest(&format!(
+        "repos/{repo}/actions/runners?per_page=100"
+    ))?)?;
+    if runners.iter().any(|r| r.busy) {
+        let jobs = running_jobs(repo)?;
+        for runner in &mut runners {
+            runner.job = jobs
+                .iter()
+                .find(|j| j.runner_name.as_deref() == Some(runner.name.as_str()))
+                .cloned();
+        }
+    }
+    Ok(runners)
+}
+
+/// The in-progress jobs of the repo's in-progress runs. The runners API doesn't say what a
+/// busy runner runs, only the jobs name their runner.
+fn running_jobs(repo: &str) -> Result<Vec<RunnerJob>, String> {
+    let runs: RunsResponse = serde_json::from_str(&gh_rest(&format!(
+        "repos/{repo}/actions/runs?status=in_progress&per_page=100"
+    ))?)
+    .map_err(|e| format!("failed to parse gh output: {e}"))?;
+    let mut jobs = Vec::new();
+    for run in runs.workflow_runs {
+        let response: JobsResponse = serde_json::from_str(&gh_rest(&format!(
+            "repos/{repo}/actions/runs/{}/jobs?filter=latest&per_page=100",
+            run.id
+        ))?)
+        .map_err(|e| format!("failed to parse gh output: {e}"))?;
+        jobs.extend(
+            response
+                .jobs
+                .into_iter()
+                .filter(|j| j.status == "in_progress"),
+        );
+    }
+    Ok(jobs)
+}
+
+/// One row per runner, in the order of `repos`, with a busy runner's job indented under it;
+/// repos without runners get a single row.
+fn format_runners(repos: &[(&str, Vec<Runner>)], now: DateTime<Utc>) -> String {
+    let rows: Vec<([String; 5], Option<&RunnerJob>)> = repos
+        .iter()
+        .flat_map(|(repo, runners)| {
+            if runners.is_empty() {
+                return vec![(
+                    [
+                        CiStatus::None.icon().to_string(),
+                        repo.to_string(),
+                        "no runners".to_string(),
+                        String::new(),
+                        String::new(),
+                    ],
+                    None,
+                )];
+            }
+            runners
+                .iter()
+                .map(|r| {
+                    (
+                        [
+                            r.icon().to_string(),
+                            repo.to_string(),
+                            r.name.clone(),
+                            r.os.clone(),
+                            r.custom_labels(),
+                        ],
+                        r.job.as_ref(),
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    let width = |col: usize| {
+        rows.iter()
+            .map(|(r, _)| r[col].chars().count())
+            .max()
+            .unwrap_or(0)
+    };
+    let (repo_w, name_w, os_w) = (width(1), width(2), width(3));
+    let mut out = String::new();
+    for ([icon, repo, name, os, labels], job) in &rows {
+        let line = format!("{icon}  {repo:<repo_w$}  {name:<name_w$}  {os:<os_w$}  {labels}");
+        out.push_str(line.trim_end());
+        out.push('\n');
+        if let Some(job) = job {
+            out.push_str(&format!(
+                "    {} / {} on {}, started {}  \x1b[34m{}\x1b[0m\n",
+                job.workflow_name,
+                job.name,
+                job.head_branch,
+                relative_time(&job.started_at, now),
+                job.html_url
+            ));
+        }
+    }
+    out
+}
+
+/// Lists the self-hosted runners of the repos under `runners.repos` in the config file.
+fn list_runners() -> Result<(), String> {
+    let repos = load_config()?.runners.repos;
+    if repos.is_empty() {
+        return Err(format!("no repos under runners.repos in ${CONFIG_ENV}"));
+    }
+    let results: Vec<_> = thread::scope(|s| {
+        let handles: Vec<_> = repos
+            .iter()
+            .map(|repo| s.spawn(move || fetch_runners(repo)))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut found = Vec::new();
+    let mut failed = 0;
+    for (repo, result) in repos.iter().zip(results) {
+        match result {
+            Ok(runners) => found.push((repo.as_str(), runners)),
+            Err(e) => {
+                eprintln!("error: {repo}: {e}");
+                failed += 1;
+            }
+        }
+    }
+    print!("{}", format_runners(&found, Utc::now()));
+    if failed > 0 {
+        return Err(format!("{failed} of {} repos failed", repos.len()));
+    }
+    Ok(())
+}
+
 #[derive(Debug, PartialEq)]
 struct RerunTarget {
     /// In `gh -R` form: `host/owner/repo`.
@@ -1458,6 +1700,7 @@ fn main() -> ExitCode {
         [cmd, url] if cmd == "rerun" => rerun_urls(url),
         [cmd, url] if cmd == "run_failed" => run_failed(&normalize_url(url)),
         [cmd, urls] if cmd == "authorize" => for_each_url(urls, "approvals", authorize),
+        [cmd] if cmd == "runners" => list_runners(),
         flags
             if flags
                 .iter()
@@ -1469,7 +1712,7 @@ fn main() -> ExitCode {
         _ => {
             eprintln!(
                 "usage: gh_wrapper [--actions] [--draft] [--watched] | merge [--force] [<pr-url>[,<pr-url>...]] | rebase <pr-url> \
-                 | wait [--no-notify] [<pr-url>] | rerun <pr-run-or-job-url>[,<url>...] | run_failed <pr-url> | authorize <pr-url>[,<pr-url>...] | completions zsh"
+                 | wait [--no-notify] [<pr-url>] | rerun <pr-run-or-job-url>[,<url>...] | run_failed <pr-url> | authorize <pr-url>[,<pr-url>...] | runners | completions zsh"
             );
             return ExitCode::FAILURE;
         }
@@ -2094,6 +2337,30 @@ CI  REPO                AUTHOR  TITLE          URL          LAST UPDATED
                     url: "".into(),
                 },
             ]
+        );
+    }
+    #[test]
+    fn runners_table() {
+        let json = r#"{"total_count":2,"runners":[
+            {"id":1,"name":"desktop","os":"Linux","status":"online","busy":true,
+             "labels":[{"id":0,"name":"self-hosted","type":"read-only"},{"id":0,"name":"qml","type":"custom"}]},
+            {"id":2,"name":"mac","os":"macOS","status":"offline","busy":false,"labels":[]}]}"#;
+        let mut runners = parse_runners(json).unwrap();
+        let jobs: JobsResponse = serde_json::from_str(
+            r#"{"jobs":[{"name":"Build (dev)","workflow_name":"Build","head_branch":"main",
+                "started_at":"2024-01-01T11:50:00Z","html_url":"https://a/job/1",
+                "status":"in_progress","runner_name":"desktop"}]}"#,
+        )
+        .unwrap();
+        runners[0].job = jobs.jobs.into_iter().next();
+        let now = "2024-01-01T12:00:00Z".parse().unwrap();
+        let table = format_runners(&[("o/r", runners), ("o/empty", vec![])], now);
+        assert_eq!(
+            table,
+            "🟡  o/r      desktop     Linux  qml\n\
+             \x20   Build / Build (dev) on main, started 10 minutes ago  \x1b[34mhttps://a/job/1\x1b[0m\n\
+             ⚫  o/r      mac         macOS\n\
+             \x20   o/empty  no runners\n"
         );
     }
 }
