@@ -1476,7 +1476,7 @@ fn gh_installed() -> bool {
 
 fn gh_authenticated() -> bool {
     Command::new("gh")
-        .args(["auth", "status"])
+        .args(["auth", "status", "--active"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .traced_status()
