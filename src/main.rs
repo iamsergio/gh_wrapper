@@ -1,5 +1,5 @@
-use std::io::{self, BufRead, BufReader};
-use std::process::{Child, Command, ExitCode, ExitStatus, Output, Stdio};
+use std::io;
+use std::process::{Command, ExitCode, ExitStatus, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1154,8 +1154,8 @@ fn wait_pr(url: &str, notify: bool) -> Result<(), String> {
     }
 }
 
-/// Shows a desktop notification about the PR with an Open button, plus Merge if `can_merge`,
-/// and blocks until it's closed. Failing to show it is only a warning.
+/// Shows a dialog about the PR with an Open button, plus Merge if `can_merge`, and blocks until
+/// it's closed. Failing to show it is only a warning.
 fn notify_pr(
     url: &str,
     pr: &PrInfo,
@@ -1172,7 +1172,7 @@ fn notify_pr(
     let body = format!("{}: {}", pr.repo, pr.title);
     match notify(summary, &body, url, icon, actions) {
         Ok(Some(action)) if action == "merge" => merge_head(url, pr)?,
-        Ok(Some(action)) if action == "open" || action == "default" => run(
+        Ok(Some(action)) if action == "open" => run(
             if cfg!(target_os = "macos") {
                 "open"
             } else {
@@ -1187,16 +1187,11 @@ fn notify_pr(
     Ok(())
 }
 
-const NOTIFICATIONS: [&str; 4] = [
-    "--dest",
-    "org.freedesktop.Notifications",
-    "--object-path",
-    "/org/freedesktop/Notifications",
-];
+const DISMISS_LABEL: &str = "Dismiss";
 
-/// Shows a desktop notification through the freedesktop D-Bus API, like notify-send but
-/// without needing libnotify installed. Blocks until it's closed, returning the key of the
-/// clicked action, if any.
+/// Shows a dialog whose buttons are the actions plus Dismiss, through `zenity` (a native GTK
+/// window, so it works on both X11 and Wayland) or `osascript` on macOS. Blocks until it's
+/// closed, returning the key of the clicked action, if any.
 fn notify(
     summary: &str,
     body: &str,
@@ -1204,40 +1199,68 @@ fn notify(
     icon: &str,
     actions: &[(&str, &str)],
 ) -> Result<Option<String>, String> {
-    if cfg!(target_os = "macos") {
-        return notify_macos(summary, body, actions);
-    }
-    let mut monitor = Command::new("gdbus")
-        .args(["monitor", "--session"])
-        .args(NOTIFICATIONS)
-        .stdout(Stdio::piped())
-        .traced_spawn()
-        .map_err(|e| format!("failed to run gdbus: {e}"))?;
-    let result = show_notification(&mut monitor, summary, body, url, icon, actions);
-    let _ = monitor.kill();
-    let _ = monitor.wait();
-    result
+    let labels = actions
+        .iter()
+        .map(|(_, label)| *label)
+        .chain([DISMISS_LABEL]);
+    let clicked = if cfg!(target_os = "macos") {
+        notify_macos(summary, body, labels)?
+    } else {
+        notify_zenity(summary, body, url, icon, labels)?
+    };
+    Ok(actions
+        .iter()
+        .find(|(_, label)| *label == clicked)
+        .map(|(key, _)| key.to_string()))
 }
 
-const DISMISS_LABEL: &str = "Dismiss";
-
-/// macOS has no D-Bus, so this shows an `osascript` alert instead (it supports at most three
-/// buttons: the actions plus Dismiss). Blocks until a button is clicked, returning the key of
-/// the clicked action, if any. The text is passed as arguments so it needs no escaping.
-fn notify_macos(
+/// With `--switch` there's no OK/Cancel and every button is an `--extra-button`, which prints
+/// its label when clicked. The text is Pango markup, so the URL can be a clickable link.
+/// Returns the clicked button's label, empty if the dialog was closed.
+fn notify_zenity<'a>(
     summary: &str,
     body: &str,
-    actions: &[(&str, &str)],
-) -> Result<Option<String>, String> {
+    url: &str,
+    icon: &str,
+    labels: impl Iterator<Item = &'a str>,
+) -> Result<String, String> {
+    // Without one zenity also exits with 1, like when a button is clicked.
+    if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return Err("no display: neither DISPLAY nor WAYLAND_DISPLAY is set".to_string());
+    }
+    let url = escape_markup(url);
+    let output = Command::new("zenity")
+        .args(["--question", "--switch", "--no-wrap"])
+        .args(["--title", "gh_wrapper", "--icon", icon])
+        .arg("--text")
+        .arg(format!(
+            "<b>{}</b>\n{}\n<a href=\"{url}\">{url}</a>",
+            escape_markup(summary),
+            escape_markup(body),
+        ))
+        .args(labels.flat_map(|label| ["--extra-button", label]))
+        .traced_output()
+        .map_err(|e| format!("failed to run zenity: {e}"))?;
+    // Extra buttons and closing the dialog exit with 1. stderr isn't checked otherwise, since
+    // GTK warns there about harmless things like a missing accessibility bus.
+    if !matches!(output.status.code(), Some(0 | 1)) {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// An `osascript` alert (it supports at most three buttons: the actions plus Dismiss).
+/// Returns the clicked button's label. The text is passed as arguments so it needs no escaping.
+fn notify_macos<'a>(
+    summary: &str,
+    body: &str,
+    labels: impl Iterator<Item = &'a str>,
+) -> Result<String, String> {
     let script = "on run argv\n\
         set btns to rest of rest of argv\n\
         set r to display alert (item 1 of argv) message (item 2 of argv) buttons btns as critical\n\
         return button returned of r\n\
         end run";
-    let labels = actions
-        .iter()
-        .map(|(_, label)| *label)
-        .chain([DISMISS_LABEL]);
     let output = Command::new("osascript")
         .args(["-e", script, "--", summary, body])
         .args(labels)
@@ -1246,133 +1269,25 @@ fn notify_macos(
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
-    let clicked = String::from_utf8_lossy(&output.stdout);
-    let clicked = clicked.trim();
-    Ok(actions
-        .iter()
-        .find(|(_, label)| *label == clicked)
-        .map(|(key, _)| key.to_string()))
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn show_notification(
-    monitor: &mut Child,
-    summary: &str,
-    body: &str,
-    url: &str,
-    icon: &str,
-    actions: &[(&str, &str)],
-) -> Result<Option<String>, String> {
-    let stdout = monitor.stdout.take().expect("stdout is piped");
-    let mut lines = BufReader::new(stdout).lines();
-    // gdbus prints this once subscribed, so a click can't come before we listen for it.
-    lines.next();
-
-    // "default" is invoked by clicking the notification body; most servers don't draw a button
-    // for it.
-    let actions: Vec<String> = [("default", "Open")]
-        .iter()
-        .chain(actions)
-        .flat_map(|(key, label)| [gvariant_string(key), gvariant_string(label)])
-        .collect();
-    let output = Command::new("gdbus")
-        .args(["call", "--session"])
-        .args(NOTIFICATIONS)
-        .args(["--method", "org.freedesktop.Notifications.Notify"])
-        .args([
-            gvariant_string("gh_wrapper"),
-            // replaces_id: 0 for a new notification.
-            "0".to_string(),
-            gvariant_string(icon),
-            gvariant_string(summary),
-            gvariant_string(&format!(
-                "{}\n<a href=\"{}\">{}</a>",
-                escape_markup(body),
-                escape_markup(url),
-                escape_markup(url)
-            )),
-            format!("[{}]", actions.join(", ")),
-            // Critical notifications stay on screen until dismissed.
-            "{'urgency': <byte 2>}".to_string(),
-            // expire_timeout: never. The -1 "server default" would be taken as an option.
-            "0".to_string(),
-        ])
-        .traced_output()
-        .map_err(|e| format!("failed to run gdbus: {e}"))?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-    }
-    let reply = String::from_utf8_lossy(&output.stdout);
-    let id = parse_notification_id(&reply)
-        .ok_or_else(|| format!("unexpected gdbus reply: {}", reply.trim()))?;
-
-    for line in lines {
-        let Ok(line) = line else { break };
-        match parse_notification_signal(&line, id) {
-            Some(NotificationSignal::Action(key)) => return Ok(Some(key)),
-            Some(NotificationSignal::Closed) => return Ok(None),
-            None => {}
-        }
-    }
-    Ok(None)
-}
-
-/// gdbus parses each argument as GVariant text, so strings are quoted to be taken literally.
-fn gvariant_string(s: &str) -> String {
-    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
-}
-
-/// Notification bodies may contain HTML-like markup.
+/// Pango markup, as in the zenity text, is HTML-like.
 fn escape_markup(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
-}
-
-/// Parses the Notify reply, e.g. "(uint32 42,)".
-fn parse_notification_id(reply: &str) -> Option<u32> {
-    reply
-        .trim()
-        .strip_prefix("(uint32 ")?
-        .strip_suffix(",)")?
-        .parse()
-        .ok()
-}
-
-#[derive(Debug, PartialEq)]
-enum NotificationSignal {
-    Action(String),
-    Closed,
-}
-
-/// Parses a `gdbus monitor` line about notification `id`, e.g.
-/// "/org/freedesktop/Notifications: org.freedesktop.Notifications.ActionInvoked (uint32 42, 'merge')".
-fn parse_notification_signal(line: &str, id: u32) -> Option<NotificationSignal> {
-    let (_, signal) = line.split_once("org.freedesktop.Notifications.")?;
-    let (name, args) = signal.split_once(' ')?;
-    let args = args.strip_prefix('(')?.strip_suffix(')')?;
-    let (signal_id, rest) = args.strip_prefix("uint32 ")?.split_once(", ")?;
-    if signal_id.parse() != Ok(id) {
-        return None;
-    }
-    match name {
-        "ActionInvoked" => {
-            let key = rest.strip_prefix('\'')?.strip_suffix('\'')?;
-            Some(NotificationSignal::Action(key.to_string()))
-        }
-        "NotificationClosed" => Some(NotificationSignal::Closed),
-        _ => None,
-    }
+        .replace('"', "&quot;")
 }
 
 /// Env var that, when set, makes every subprocess be logged to stderr with its duration.
 const DEBUG_ENV: &str = "GHW_DEBUG";
 
-/// `status`/`output`/`spawn` that log the command line and how long it took if `DEBUG_ENV` is
+/// `status`/`output` that log the command line and how long it took if `DEBUG_ENV` is
 /// set. The line is printed before running, so a hanging command is visible.
 trait Traced {
     fn traced_status(&mut self) -> io::Result<ExitStatus>;
     fn traced_output(&mut self) -> io::Result<Output>;
-    fn traced_spawn(&mut self) -> io::Result<Child>;
 }
 
 impl Traced for Command {
@@ -1382,10 +1297,6 @@ impl Traced for Command {
 
     fn traced_output(&mut self) -> io::Result<Output> {
         trace(self, Command::output)
-    }
-
-    fn traced_spawn(&mut self) -> io::Result<Child> {
-        trace(self, Command::spawn)
     }
 }
 
@@ -1969,44 +1880,10 @@ mod tests {
     }
 
     #[test]
-    fn gvariant_string_escapes_quotes() {
-        assert_eq!(gvariant_string(r"it's a\b"), r"'it\'s a\\b'");
-    }
-
-    #[test]
     fn escape_markup_escapes_html() {
         assert_eq!(
-            escape_markup("a < b && c > d"),
-            "a &lt; b &amp;&amp; c &gt; d"
-        );
-    }
-
-    #[test]
-    fn parse_notification_id_reads_reply() {
-        assert_eq!(parse_notification_id("(uint32 253,)\n"), Some(253));
-        assert_eq!(parse_notification_id("()"), None);
-    }
-
-    #[test]
-    fn parse_notification_signal_matches_id() {
-        let prefix = "/org/freedesktop/Notifications: org.freedesktop.Notifications.";
-        let parse = |line: &str| parse_notification_signal(&format!("{prefix}{line}"), 42);
-        assert_eq!(
-            parse("ActionInvoked (uint32 42, 'merge')"),
-            Some(NotificationSignal::Action("merge".into()))
-        );
-        assert_eq!(
-            parse("NotificationClosed (uint32 42, uint32 2)"),
-            Some(NotificationSignal::Closed)
-        );
-        assert_eq!(parse("NotificationClosed (uint32 4242, uint32 1)"), None);
-        assert_eq!(parse("ActivationToken (uint32 42, 'xyz')"), None);
-        assert_eq!(
-            parse_notification_signal(
-                "The name org.freedesktop.Notifications is owned by :1.24",
-                42
-            ),
-            None
+            escape_markup(r#"a < b && "c" > d"#),
+            "a &lt; b &amp;&amp; &quot;c&quot; &gt; d"
         );
     }
 
