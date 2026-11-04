@@ -522,6 +522,7 @@ const PR_APPROVAL_QUERY: &str = "query($url: URI!) {
 const PR_INFO_QUERY: &str = "query($url: URI!) {
   resource(url: $url) {
     ... on PullRequest {
+      number
       title
       state
       repository { nameWithOwner }
@@ -556,6 +557,7 @@ struct ResourceData {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Resource {
+    number: Option<u64>,
     title: Option<String>,
     state: Option<String>,
     repository: Option<Repository>,
@@ -570,6 +572,7 @@ struct PrInfo {
     ci: CiStatus,
     /// OPEN, CLOSED or MERGED.
     state: String,
+    number: u64,
     title: String,
     repo: String,
     head_branch: String,
@@ -587,6 +590,7 @@ fn parse_pr_info(json: &str) -> Result<PrInfo, String> {
         ci: resource.commits.ok_or_else(not_a_pr)?.ci_status(),
         title: resource.title.ok_or_else(not_a_pr)?,
         state: resource.state.ok_or_else(not_a_pr)?,
+        number: resource.number.ok_or_else(not_a_pr)?,
         repo: resource.repository.ok_or_else(not_a_pr)?.name_with_owner,
         head_branch: resource.head_ref_name.ok_or_else(not_a_pr)?,
         head_oid: resource.head_ref_oid.ok_or_else(not_a_pr)?,
@@ -689,19 +693,83 @@ fn merge_pr(url: &str, force: bool) -> Result<(), String> {
     result
 }
 
+/// How often `merge_head` polls a merge running in the background.
+const MERGE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How long `merge_head` waits for a background merge before giving up on it.
+const MERGE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// Response of the asynchronous merge endpoint, both when requesting and when polling.
+#[derive(Debug, Deserialize, PartialEq)]
+struct AsyncMerge {
+    /// pending, merged, enqueued or failed.
+    status: String,
+    #[serde(default)]
+    details: AsyncMergeDetails,
+}
+
+#[derive(Debug, Default, Deserialize, PartialEq)]
+struct AsyncMergeDetails {
+    message: Option<String>,
+    /// Only while pending.
+    uuid: Option<String>,
+}
+
+fn parse_async_merge(json: &str) -> Result<AsyncMerge, String> {
+    serde_json::from_str(json).map_err(|e| format!("failed to parse gh output: {e}"))
+}
+
+/// Runs `gh api` with `args` and returns its parsed response; gh reports errors on stderr.
+fn gh_async_merge(args: &[&str]) -> Result<AsyncMerge, String> {
+    let output = Command::new("gh")
+        .arg("api")
+        .args(args)
+        .stderr(Stdio::inherit())
+        .traced_output()
+        .map_err(|e| format!("failed to run gh: {e}"))?;
+    if !output.status.success() {
+        return Err("`gh api` merge request failed".to_string());
+    }
+    parse_async_merge(&String::from_utf8_lossy(&output.stdout))
+}
+
 /// Merges the PR at the head commit `pr` was fetched at.
 fn merge_head(url: &str, pr: &PrInfo) -> Result<(), String> {
-    // Passing a merge method makes gh non-interactive. --delete-branch isn't used because it
-    // also deletes the local branch; the remote one is deleted below instead.
-    // --match-head-commit refuses the merge if someone pushed after CI was checked.
-    let status = Command::new("gh")
-        .args(["pr", "merge", url, "--rebase", "--match-head-commit"])
-        .arg(&pr.head_oid)
-        .traced_status()
-        .map_err(|e| format!("failed to run gh: {e}"))?;
-    if !status.success() {
-        return Err("`gh pr merge` failed".to_string());
+    // The asynchronous REST endpoint is used because `gh pr merge` (GraphQL's
+    // mergePullRequest) refuses PRs in a stack. Passing `sha` refuses the merge if someone
+    // pushed after CI was checked. The head branch is deleted below, not by GitHub, as before.
+    let endpoint = format!("repos/{}/pulls/{}/merge-async", pr.repo, pr.number);
+    let sha = format!("sha={}", pr.head_oid);
+    let mut merge = gh_async_merge(&[
+        "-X",
+        "PUT",
+        &endpoint,
+        "-f",
+        "merge_action=direct_merge",
+        "-f",
+        "merge_method=rebase",
+        "-f",
+        &sha,
+    ])?;
+    let start = Instant::now();
+    loop {
+        match (merge.status.as_str(), merge.details.uuid.as_deref()) {
+            ("merged", _) => break,
+            ("pending", Some(uuid)) if start.elapsed() < MERGE_TIMEOUT => {
+                thread::sleep(MERGE_POLL_INTERVAL);
+                match gh_async_merge(&[&format!("{endpoint}/{uuid}")]) {
+                    Ok(new) => merge = new,
+                    Err(e) => eprintln!("warning: {e}, retrying"),
+                }
+            }
+            ("pending", _) => return Err(format!("merge still pending, see {url}")),
+            (status, _) => {
+                let message = merge.details.message.as_deref().unwrap_or("no details");
+                return Err(format!("merge {status}: {message}"));
+            }
+        }
     }
+    println!("Merged {}#{}: {}", pr.repo, pr.number, pr.title);
 
     if let Some(repo) = &pr.head_repo {
         delete_remote_branch(repo, &pr.head_branch);
@@ -1837,7 +1905,7 @@ mod tests {
 
     #[test]
     fn parse_pr_info_reads_head_and_ci() {
-        let json = r#"{"data":{"resource":{"title":"t","state":"OPEN","repository":{"nameWithOwner":"o/r"},
+        let json = r#"{"data":{"resource":{"number":7,"title":"t","state":"OPEN","repository":{"nameWithOwner":"o/r"},
             "headRefName":"feat/x","headRefOid":"abc123","headRepository":{"nameWithOwner":"o/r"},
             "commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"SUCCESS"}}}]}}}}"#;
         assert_eq!(
@@ -1845,6 +1913,7 @@ mod tests {
             Ok(PrInfo {
                 ci: CiStatus::Success,
                 state: "OPEN".into(),
+                number: 7,
                 title: "t".into(),
                 repo: "o/r".into(),
                 head_branch: "feat/x".into(),
@@ -1853,12 +1922,27 @@ mod tests {
             })
         );
 
-        let json = r#"{"data":{"resource":{"title":"t","state":"OPEN","repository":{"nameWithOwner":"o/r"},
+        let json = r#"{"data":{"resource":{"number":7,"title":"t","state":"OPEN","repository":{"nameWithOwner":"o/r"},
             "headRefName":"feat/x","headRefOid":"abc123","headRepository":null,
             "commits":{"nodes":[{"commit":{"statusCheckRollup":null}}]}}}}"#;
         let pr = parse_pr_info(json).unwrap();
         assert_eq!(pr.ci, CiStatus::None);
         assert_eq!(pr.head_repo, None);
+    }
+
+    #[test]
+    fn parse_async_merge_reads_status_and_uuid() {
+        let json = r#"{"status":"pending","details":{"message":"Merge in progress","uuid":"u1",
+            "merge_method":"rebase","merge_action":"direct_merge","expected_head_sha":"abc"}}"#;
+        let merge = parse_async_merge(json).unwrap();
+        assert_eq!(merge.status, "pending");
+        assert_eq!(merge.details.uuid.as_deref(), Some("u1"));
+
+        let json = r#"{"status":"merged","details":{"message":"Merged","sha":"def"}}"#;
+        assert_eq!(parse_async_merge(json).unwrap().details.uuid, None);
+
+        let merge = parse_async_merge(r#"{"status":"failed"}"#).unwrap();
+        assert_eq!(merge.details.message, None);
     }
 
     #[test]
